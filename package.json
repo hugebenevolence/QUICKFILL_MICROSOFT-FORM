@@ -1,0 +1,26 @@
+{
+  "name": "quickfill-microsoft-forms",
+  "version": "1.0.0",
+  "description": "Chrome Extension to automatically fill Microsoft Forms with intelligent customization",
+  "main": "background.js",
+  "scripts": {
+    "build": "echo 'No build process needed for this extension'",
+    "test": "echo 'No tests specified'",
+    "dev": "echo 'Load extension in Chrome Developer mode'"
+  },
+  "keywords": [
+    "chrome-extension",
+    "microsoft-forms",
+    "automation",
+    "form-filler",
+    "ai-integration"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/quickfill-microsoft-forms"
+  },
+  "devDependencies": {},
+  "dependencies": {}
+}

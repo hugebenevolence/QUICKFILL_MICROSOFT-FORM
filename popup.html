@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="vi" style="width: 450px; height: auto;">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QuickFill Microsoft Forms</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 QuickFill Forms v2.0</h1>
+            <p>Tự động điền Microsoft Forms với cấu hình linh hoạt</p>
+        </header>
+
+        <div id="status" class="status" style="display: none;"></div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('basic')">Cơ bản</div>
+            <div class="tab" onclick="switchTab('advanced')">Nâng cao</div>
+            <div class="tab" onclick="switchTab('questions')">Câu hỏi</div>
+        </div>
+
+        <!-- Basic Settings Tab -->
+        <div id="basic-tab" class="tab-content active">
+                <div class="section rating-section">
+                <h3>⭐ Cài đặt Likert Scale</h3>
+                <div class="rating-config">
+                    <label>Phạm vi điểm đánh giá:</label>
+                    <div class="range-inputs">
+                        <div class="input-with-label">
+                            <label for="ratingMin" class="small-label">Tối thiểu</label>
+                            <input type="number" id="ratingMin" min="1" max="5" value="4">
+                        </div>
+                        <span class="range-separator">đến</span>
+                        <div class="input-with-label">
+                            <label for="ratingMax" class="small-label">Tối đa</label>
+                            <input type="number" id="ratingMax" min="1" max="5" value="5">
+                        </div>
+                    </div>
+                    <div class="rating-preview">
+                        <span>Ví dụ: Sẽ chọn điểm <strong id="previewRange">4-5</strong> trên thang điểm 5</span>
+                    </div>
+                    <small>💡 Để có đánh giá tích cực, nên chọn 4-5 cho thang điểm 5</small>
+                </div>
+            </div>            <div class="section">
+                <h3>📋 Tùy chọn cơ bản</h3>
+                <div class="checkbox-group">
+                    <label>
+                        <input type="checkbox" id="preferPositiveAnswers" checked>
+                        Ưu tiên câu trả lời tích cực
+                    </label>
+                    <label>
+                        <input type="checkbox" id="avoidOther" checked>
+                        Tránh lựa chọn "Khác"
+                    </label>
+                    <label>
+                        <input type="checkbox" id="autoSubmitAnother" checked>
+                        Tự động gửi form mới sau khi hoàn thành
+                    </label>
+                </div>
+                
+                <div class="form-group">
+                    <label>Ngôn ngữ văn bản:</label>
+                    <select id="textLanguage">
+                        <option value="vi">Tiếng Việt</option>
+                        <option value="en">English</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>🔄 Cài đặt lặp lại</h3>
+                <div class="form-group">
+                    <label>Số lần gửi tối đa (0 = không giới hạn):</label>
+                    <input type="number" id="maxFormSubmissions" min="0" value="0" placeholder="0">
+                </div>
+                
+                <div class="form-group">
+                    <label>Thời gian chờ giữa các lần gửi (giây):</label>
+                    <input type="number" id="submitDelay" min="1" max="60" value="3" placeholder="3">
+                    <small>Thời gian chờ trước khi bắt đầu form mới</small>
+                </div>
+            </div>
+        </div>
+
+        <!-- Advanced Settings Tab -->
+        <div id="advanced-tab" class="tab-content">
+            <div class="section">
+                <h3>� API Settings (Tùy chọn)</h3>
+                <div class="form-group">
+                    <label for="geminiApiKey">Gemini API Key:</label>
+                    <input type="password" id="geminiApiKey" placeholder="Nhập API key (không bắt buộc)">
+                    <small>Dùng để tạo câu trả lời text tự nhiên hơn</small>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>⏱️ Cài đặt thời gian</h3>
+                <div class="checkbox-group">
+                    <label>
+                        <input type="checkbox" id="useRandomDelay" checked>
+                        Sử dụng độ trễ ngẫu nhiên
+                    </label>
+                </div>
+                
+                <div class="delay-config" id="delayConfig">
+                    <label>Độ trễ (ms):</label>
+                    <div class="range-inputs">
+                        <input type="number" id="delayMin" min="100" max="5000" value="500" placeholder="Min">
+                        <span>đến</span>
+                        <input type="number" id="delayMax" min="100" max="5000" value="2000" placeholder="Max">
+                    </div>
+                    <small>Thời gian chờ giữa các thao tác</small>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>🚀 Cài đặt hiệu suất</h3>
+                <div class="form-group">
+                    <label>Số lần thử tối đa cho mỗi câu hỏi:</label>
+                    <input type="number" id="maxRetries" min="1" max="10" value="3" placeholder="3">
+                </div>
+                
+                <div class="form-group">
+                    <label>Timeout cho từng câu hỏi (ms):</label>
+                    <input type="number" id="questionTimeout" min="1000" max="10000" value="5000" placeholder="5000">
+                </div>
+            </div>
+        </div>
+
+        <!-- Special Questions Tab -->
+        <div id="questions-tab" class="tab-content">
+            <div class="section">
+                <h3>❓ Câu trả lời cố định</h3>
+                <p>Thiết lập câu trả lời cố định cho các câu hỏi cụ thể</p>
+                
+                <div id="specialQuestions">
+                    <div class="question-item">
+                        <input type="text" placeholder="Từ khóa câu hỏi (VD: 'tên', 'tuổi', 'email')" class="question-keyword">
+                        <input type="text" placeholder="Câu trả lời cố định" class="question-answer">
+                        <button class="remove-question" onclick="removeQuestion(this)">❌</button>
+                    </div>
+                </div>
+                
+                <button id="addQuestion" class="btn secondary" onclick="addQuestion()">➕ Thêm câu hỏi</button>
+            </div>
+
+            <div class="section">
+                <h3>🎯 Radio Button Preferences</h3>
+                <p>Tùy chỉnh cách chọn câu trả lời cho câu hỏi radio</p>
+                
+                <div class="radio-preferences">
+                    <label>
+                        <input type="radio" name="radioStrategy" value="random" checked>
+                        Chọn ngẫu nhiên
+                    </label>
+                    <label>
+                        <input type="radio" name="radioStrategy" value="first">
+                        Chọn lựa chọn đầu tiên (tránh "Khác")
+                    </label>
+                    <label>
+                        <input type="radio" name="radioStrategy" value="middle">
+                        Ưu tiên lựa chọn ở giữa
+                    </label>
+                    <label>
+                        <input type="radio" name="radioStrategy" value="positive">
+                        Ưu tiên câu trả lời tích cực
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="buttons">
+            <button id="fillForm" class="btn primary">🎯 Bắt đầu điền Form</button>
+            <button id="stopFilling" class="btn danger" style="display: none;">⏹️ Dừng lại</button>
+            <button id="saveSettings" class="btn secondary">💾 Lưu cài đặt</button>
+            <button id="resetSettings" class="btn secondary">🔄 Reset</button>
+            <button id="debugConnection" class="btn secondary" style="font-size: 12px;">🔧 Debug Connection</button>
+        </div>
+
+        <!-- Instructions -->
+        <div class="section">
+            <details>
+                <summary>📖 Hướng dẫn sử dụng</summary>
+                <div class="instructions">
+                    <ol>
+                        <li><strong>Mở Microsoft Forms:</strong> Điều hướng đến form cần điền</li>
+                        <li><strong>Cấu hình:</strong> Thiết lập các tùy chọn trong extension</li>
+                        <li><strong>Điền form:</strong> Nhấn "Bắt đầu điền Form"</li>
+                        <li><strong>Tự động:</strong> Extension sẽ tự động điền và gửi form</li>
+                    </ol>
+                    <p><strong>💡 Mẹo:</strong></p>
+                    <ul>
+                        <li>Cài đặt Likert 4-5 để có điểm đánh giá tích cực</li>
+                        <li>Sử dụng câu trả lời cố định cho các câu hỏi quan trọng</li>
+                        <li>Bật tự động gửi form mới để lặp lại process</li>
+                    </ul>
+                </div>
+            </details>
+        </div>
+
+        <footer>
+            <p>🚀 <strong>QuickFill v2.0</strong> - Tự động hóa Microsoft Forms thông minh</p>
+        </footer>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

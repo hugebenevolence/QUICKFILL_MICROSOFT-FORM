@@ -1,0 +1,1432 @@
+// QuickFill Microsoft Forms - Content Script v2.1
+// Enhanced with improved form filling logic from successful console script
+
+// Prevent multiple injections
+if (window.quickFillFormsV2Instance) {
+    console.log('QuickFill content script already loaded');
+} else {
+
+class QuickFillFormsV2 {
+    constructor() {
+        this.isRunning = false;
+        this.settings = {};
+        this.submissionCount = 0;
+        this.specialQuestions = [];
+        this.processedQuestions = new Set();
+        this.totalFilled = 0;
+        this.init();
+    }
+
+    init() {
+        // Listen for messages from popup
+        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            this.handleMessage(message, sender, sendResponse);
+            return true; // Keep channel open for async responses
+        });
+
+        console.log('🚀 QuickFill Microsoft Forms v2.1 loaded');
+        
+        // Mark this instance as the active one
+        window.quickFillActive = true;
+    }
+
+    async handleMessage(message, sender, sendResponse) {
+        try {
+            switch (message.action) {
+                case 'ping':
+                    sendResponse({ success: true, ready: true });
+                    break;
+
+                case 'startFilling':
+                    const result = await this.startFilling(message.settings);
+                    sendResponse({ success: true, result });
+                    break;
+
+                case 'stopFilling':
+                    this.stopFilling();
+                    sendResponse({ success: true });
+                    break;
+
+                default:
+                    sendResponse({ success: false, error: 'Unknown action' });
+            }
+        } catch (error) {
+            console.error('Error handling message:', error);
+            sendResponse({ success: false, error: error.message });
+        }
+    }
+
+    async startFilling(settings) {
+        console.log('🚀 Starting form filling with settings:', settings);
+        
+        this.settings = settings || {};
+        this.isRunning = true;
+        this.submissionCount = 0;
+        this.processedQuestions.clear();
+        this.totalFilled = 0;
+
+        // Set up special questions if provided
+        this.specialQuestions = this.settings.specialQuestions || [];
+        console.log('🔧 Special questions loaded:', this.specialQuestions.length);
+
+        try {
+            await this.fillCurrentForm();
+            return { success: true, message: 'Form filling completed' };
+        } catch (error) {
+            console.error('Error in startFilling:', error);
+            this.isRunning = false;
+            throw error;
+        }
+    }
+
+    stopFilling() {
+        console.log('⏹️ Stopping form filling');
+        this.isRunning = false;
+    }
+
+    sendStatusToPopup(message, type = 'info') {
+        try {
+            chrome.runtime.sendMessage({
+                action: 'updateStatus',
+                status: message,
+                type: type
+            });
+        } catch (error) {
+            console.log('Could not send status to popup:', error.message);
+        }
+    }
+
+    // Utility Functions
+    log(message, type = 'info') {
+        const emoji = type === 'success' ? '✅' : type === 'error' ? '❌' : type === 'warning' ? '⚠️' : '📋';
+        console.log(`${emoji} QuickFill: ${message}`);
+    }
+
+    randomDelay(min = 50, max = 200) {
+        return new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
+    }
+
+    delay(min, max = null) {
+        if (max === null) {
+            return new Promise(resolve => setTimeout(resolve, min));
+        }
+        return this.randomDelay(min, max);
+    }
+
+    isElementVisible(element) {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && 
+               style.display !== 'none' && 
+               style.visibility !== 'hidden' &&
+               style.opacity !== '0' &&
+               element.offsetParent !== null;
+    }
+
+    isElementClickable(element) {
+        if (!this.isElementVisible(element)) return false;
+        const style = window.getComputedStyle(element);
+        return style.pointerEvents !== 'none' && !element.disabled;
+    }
+
+    getQuestionText(questionElement) {
+        const titleElement = questionElement.querySelector('[data-automation-id="questionTitle"]');
+        return titleElement ? titleElement.textContent.trim() : 'Unknown Question';
+    }
+
+    // Main form filling logic
+    async fillCurrentForm() {
+        while (this.isRunning) {
+            try {
+                this.sendStatusToPopup(`Điền form lần ${this.submissionCount + 1}...`, 'info');
+
+                let sessionFilled = 0;
+                
+                // Fill choice questions (main content)
+                this.log('🔄 Filling choice questions...');
+                sessionFilled += await this.fillChoiceQuestions();
+                
+                // Fill text fields
+                this.log('🔄 Filling text fields...');
+                sessionFilled += await this.fillTextFields();
+                
+                this.totalFilled += sessionFilled;
+                
+                if (sessionFilled > 0) {
+                    this.log(`Filled ${sessionFilled} fields in this session (Total: ${this.totalFilled})`, 'success');
+                    await this.delay(500, 800);
+                }
+
+                // Check validation errors
+                const errors = this.checkValidationErrors();
+                if (errors.length > 0) {
+                    this.log('⚠️ Validation errors found:', 'warning');
+                    errors.forEach(error => this.log(`  • ${error}`, 'warning'));
+                }
+
+                // Try to proceed to next page or submit
+                const proceeded = await this.proceedToNext();
+                if (!proceeded) {
+                    this.log('🎉 Form appears to be complete!', 'success');
+                    break;
+                }
+
+            } catch (error) {
+                console.error('Error in form filling loop:', error);
+                this.sendStatusToPopup(`Lỗi: ${error.message}`, 'error');
+                break;
+            }
+        }
+
+        this.isRunning = false;
+        chrome.runtime.sendMessage({ action: 'fillingStopped' });
+    }
+
+    // Enhanced choice question filling based on successful console script
+    async fillChoiceQuestions() {
+        const questions = document.querySelectorAll('[data-automation-id="questionItem"]');
+        let filled = 0;
+        
+        this.log(`Found ${questions.length} questions to process`);
+        
+        for (const question of questions) {
+            if (!this.isElementVisible(question)) continue;
+            
+            const questionText = this.getQuestionText(question);
+            const questionId = question.id || questionText;
+            
+            // Skip if already processed
+            if (this.processedQuestions.has(questionId)) {
+                this.log(`Skipping already processed: ${questionText.substring(0, 50)}...`);
+                continue;
+            }
+            
+            // Check if this is a Likert table - try multiple selectors
+            let likertTable = question.querySelector('table[aria-labelledby]');
+            
+            if (!likertTable) {
+                // Try alternative Likert table selectors
+                likertTable = question.querySelector('table') || 
+                             question.querySelector('[class*="liker"]') ||
+                             question.querySelector('[class*="Liker"]');
+                
+                if (likertTable) {
+                    this.log(`🔍 Found Likert table via alternative selector`);
+                }
+            }
+            
+            if (likertTable) {
+                this.log(`🎯 Processing Likert table: ${questionText.substring(0, 80)}...`);
+                const likertFilled = await this.fillLikertTable(question, likertTable);
+                filled += likertFilled;
+                if (likertFilled > 0) {
+                    this.processedQuestions.add(questionId);
+                } else {
+                    this.log(`⚠️ Likert table found but no rows filled`, 'warning');
+                }
+                continue;
+            }
+            
+            // Find choice items within this question (standard radio/checkbox)
+            let choiceItems = question.querySelectorAll('[data-automation-id="choiceItem"]');
+            
+            // Try alternative selectors if no choice items found
+            if (choiceItems.length === 0) {
+                const alternativeSelectors = [
+                    'input[type="radio"] + *', // Radio with label
+                    'input[type="checkbox"] + *', // Checkbox with label
+                    '[role="radio"]',
+                    '[role="checkbox"]',
+                    '.form-control-choice',
+                    '.choice-item',
+                    '[data-choice-id]'
+                ];
+                
+                for (const selector of alternativeSelectors) {
+                    const altChoices = question.querySelectorAll(selector);
+                    if (altChoices.length > 0) {
+                        choiceItems = altChoices;
+                        this.log(`🔍 Found ${altChoices.length} choices via alternative selector: ${selector}`);
+                        break;
+                    }
+                }
+            }
+            
+            if (choiceItems.length === 0) {
+                this.log(`No choice items found in: ${questionText.substring(0, 50)}...`);
+                continue;
+            }
+            
+            this.log(`Processing standard question: ${questionText.substring(0, 80)}...`);
+            this.log(`Found ${choiceItems.length} choice options`);
+            
+            // Detect question type
+            const questionType = this.detectQuestionType(question, choiceItems);
+            this.log(`🎯 Question type detected: ${questionType}`);
+            
+            // Filter out "Other" options if configured
+            let validChoices = Array.from(choiceItems).filter(choice => 
+                this.isElementClickable(choice)
+            );
+            
+            if (this.settings.avoidOther && validChoices.length > 1) {
+                const nonOtherChoices = validChoices.filter(choice => {
+                    const text = choice.textContent.toLowerCase();
+                    return !text.includes('other') && 
+                           !text.includes('khác') && 
+                           !text.includes('others') &&
+                           !text.includes('altro') &&
+                           !text.includes('其他') &&
+                           !text.includes('другой') &&
+                           !text.includes('specify') &&
+                           !text.includes('chi tiết') &&
+                           !text.includes('khác (xin ghi rõ)');
+                });
+                
+                if (nonOtherChoices.length > 0) {
+                    validChoices = nonOtherChoices;
+                    this.log(`Filtered out "Other" options, ${validChoices.length} valid choices remain`);
+                }
+            }
+            
+            if (validChoices.length === 0) {
+                this.log(`No valid choices found for: ${questionText.substring(0, 50)}...`, 'warning');
+                continue;
+            }
+            
+            // Handle different question types
+            let selectedChoices = [];
+            
+            if (questionType === 'rating') {
+                this.log('🎯 Processing rating question...');
+                selectedChoices = this.selectRatingChoices(validChoices, questionText);
+            } else if (questionType === 'checkbox') {
+                this.log('☑️ Processing checkbox question...');
+                selectedChoices = this.selectCheckboxChoices(validChoices, questionText);
+            } else if (questionType === 'radio') {
+                this.log('🔘 Processing radio question...');
+                selectedChoices = this.selectRadioChoice(validChoices, questionText);
+            } else {
+                this.log('📋 Processing general question...');
+                selectedChoices = this.selectSmartChoice(validChoices, questionText);
+            }
+            
+            // Process selected choices
+            if (selectedChoices.length > 0) {
+                let successCount = 0;
+                
+                for (const selectedChoice of selectedChoices) {
+                    try {
+                        this.log(`🎯 Attempting to select: "${selectedChoice.textContent.trim()}"`);
+                        
+                        // Simulate natural user interaction
+                        await this.delay(100, 200);
+                        
+                        // Try multiple attempts if first fails
+                        let clickSuccess = false;
+                        let attempts = 0;
+                        const maxAttempts = 3;
+                        
+                        while (!clickSuccess && attempts < maxAttempts) {
+                            attempts++;
+                            this.log(`   Attempt ${attempts}/${maxAttempts} for: ${selectedChoice.textContent.trim()}`);
+                            
+                            clickSuccess = await this.simulateClick(selectedChoice);
+                            
+                            if (!clickSuccess && attempts < maxAttempts) {
+                                this.log(`   Attempt ${attempts} failed, waiting before retry...`);
+                                await this.delay(600, 1000);
+                            }
+                        }
+                        
+                        if (clickSuccess) {
+                            this.log(`✅ Successfully selected: ${selectedChoice.textContent.trim()}`);
+                            successCount++;
+                        } else {
+                            this.log(`❌ Failed to select after ${maxAttempts} attempts: ${selectedChoice.textContent.trim()}`, 'error');
+                        }
+                        
+                        if (selectedChoices.length > 1) {
+                            await this.delay(50, 100);
+                        }
+                        
+                    } catch (error) {
+                        this.log(`Error selecting choice: ${error.message}`, 'error');
+                        console.error('Full error details:', error);
+                    }
+                }
+                
+                if (successCount > 0) {
+                    filled += successCount;
+                    this.processedQuestions.add(questionId);
+                    this.log(`✅ Question completed: ${successCount}/${selectedChoices.length} selections successful`);
+                }
+                
+                await this.delay(50, 100);
+            }
+        }
+        
+        return filled;
+    }
+
+    // Detect question type based on DOM structure and content
+    detectQuestionType(questionElement, choiceItems) {
+        // Check for checkboxes
+        const hasCheckboxes = questionElement.querySelector('input[type="checkbox"]') || 
+                             Array.from(choiceItems).some(choice => 
+                                 choice.getAttribute('role') === 'checkbox' ||
+                                 choice.querySelector('input[type="checkbox"]')
+                             );
+        
+        if (hasCheckboxes) return 'checkbox';
+        
+        // Check for radio buttons  
+        const hasRadios = questionElement.querySelector('input[type="radio"]') ||
+                         Array.from(choiceItems).some(choice => 
+                             choice.getAttribute('role') === 'radio' ||
+                             choice.querySelector('input[type="radio"]')
+                         );
+        
+        if (hasRadios) {
+            // Check if it's a rating question
+            const questionText = this.getQuestionText(questionElement).toLowerCase();
+            const isRating = Array.from(choiceItems).some(choice => {
+                const text = choice.textContent.trim();
+                return /^\d+$/.test(text);
+            }) || /rating|điểm|đánh giá|point|scale|sao|star/i.test(questionText);
+            
+            return isRating ? 'rating' : 'radio';
+        }
+        
+        return 'general';
+    }
+
+    // Smart selection for rating questions
+    selectRatingChoices(validChoices, questionText) {
+        this.log('🎯 Applying smart rating selection...');
+        
+        const ratingMin = this.settings.ratingMin || 4;
+        const ratingMax = this.settings.ratingMax || 5;
+        
+        // For rating questions, prefer higher ratings within configured range
+        const ratingChoices = validChoices.filter(choice => {
+            const text = choice.textContent.trim();
+            const value = parseInt(text);
+            return !isNaN(value) && value >= ratingMin && value <= ratingMax;
+        });
+        
+        if (ratingChoices.length > 0) {
+            // Weighted selection favoring higher ratings
+            const weights = ratingChoices.map((_, index) => Math.pow(2, index + 1));
+            const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+            let random = Math.random() * totalWeight;
+            
+            for (let i = weights.length - 1; i >= 0; i--) {
+                random -= weights[i];
+                if (random <= 0) {
+                    return [ratingChoices[i]];
+                }
+            }
+        }
+        
+        // Fallback: select highest available rating
+        const numericChoices = validChoices.filter(choice => {
+            const text = choice.textContent.trim();
+            return !isNaN(parseInt(text));
+        });
+        
+        if (numericChoices.length > 0) {
+            // Sort by numeric value and pick the highest
+            numericChoices.sort((a, b) => {
+                const aVal = parseInt(a.textContent.trim());
+                const bVal = parseInt(b.textContent.trim());
+                return bVal - aVal; // Descending order
+            });
+            return [numericChoices[0]];
+        }
+        
+        return [validChoices[Math.floor(Math.random() * validChoices.length)]];
+    }
+
+    // Smart selection for checkbox questions (multiple selections allowed)
+    selectCheckboxChoices(validChoices, questionText) {
+        this.log('☑️ Applying smart checkbox selection...');
+        
+        const selectedChoices = [];
+        const maxSelections = Math.min(this.settings.checkboxMaxSelections || 3, validChoices.length);
+        const numSelections = Math.floor(Math.random() * maxSelections) + 1; // At least 1, max configured
+        
+        this.log(`   Selecting ${numSelections} out of ${validChoices.length} options`);
+        
+        if (this.settings.preferPositiveAnswers) {
+            // Prefer positive answers
+            const positiveChoices = validChoices.filter(choice => {
+                const text = choice.textContent.toLowerCase();
+                return text.includes('có') || text.includes('yes') || text.includes('đồng ý') ||
+                       text.includes('hài lòng') || text.includes('satisfied') || text.includes('good') ||
+                       text.includes('tốt') || text.includes('thích') || text.includes('like') ||
+                       text.includes('rất') || text.includes('very') || text.includes('excellent');
+            });
+            
+            if (positiveChoices.length > 0) {
+                this.log(`   Found ${positiveChoices.length} positive options`);
+                
+                // Select from positive choices first
+                const shuffled = [...positiveChoices].sort(() => Math.random() - 0.5);
+                selectedChoices.push(...shuffled.slice(0, Math.min(numSelections, positiveChoices.length)));
+            }
+        }
+        
+        // Fill remaining selections randomly
+        if (selectedChoices.length < numSelections) {
+            const remaining = validChoices.filter(choice => !selectedChoices.includes(choice));
+            const shuffled = [...remaining].sort(() => Math.random() - 0.5);
+            selectedChoices.push(...shuffled.slice(0, numSelections - selectedChoices.length));
+        }
+        
+        return selectedChoices;
+    }
+
+    // Smart selection for radio questions (single selection)
+    selectRadioChoice(validChoices, questionText) {
+        this.log('🔘 Applying smart radio selection...');
+        
+        // Check for special radio questions with predefined answers
+        const lowerQuestionText = questionText.toLowerCase();
+        this.log(`🔍 Checking special questions for: "${questionText.substring(0, 60)}..."`);
+        
+        // Check special questions from settings
+        if (this.specialQuestions && Array.isArray(this.specialQuestions)) {
+            for (const specialQuestion of this.specialQuestions) {
+                if (!specialQuestion.keywords || !Array.isArray(specialQuestion.keywords)) {
+                    continue;
+                }
+                
+                const matchedKeyword = specialQuestion.keywords.find(keyword => 
+                    lowerQuestionText.includes(keyword.toLowerCase())
+                );
+                
+                if (matchedKeyword) {
+                this.log(`🎯 Found special question match: "${matchedKeyword}" -> Default: "${specialQuestion.defaultAnswer}"`);
+                
+                // Try to find exact match first
+                let targetChoice = validChoices.find(choice => {
+                    const choiceText = choice.textContent.trim().toLowerCase();
+                    return choiceText === specialQuestion.defaultAnswer.toLowerCase();
+                });
+                
+                // If exact match not found, try partial match
+                if (!targetChoice) {
+                    targetChoice = validChoices.find(choice => {
+                        const choiceText = choice.textContent.trim().toLowerCase();
+                        return choiceText.includes(specialQuestion.defaultAnswer.toLowerCase()) ||
+                               specialQuestion.defaultAnswer.toLowerCase().includes(choiceText);
+                    });
+                }
+                
+                if (targetChoice) {
+                    this.log(`✅ Selected special answer: "${targetChoice.textContent.trim()}" for question type: ${matchedKeyword}`);
+                    return [targetChoice];
+                } else {
+                    this.log(`⚠️ Could not find matching choice for "${specialQuestion.defaultAnswer}", falling back to smart selection`);
+                }
+            }
+        }
+        
+        if (this.settings.preferPositiveAnswers) {
+            // Prefer positive answers for subjective questions
+            const subjectiveKeywords = ['cảm thấy', 'feel', 'think', 'nghĩ', 'đánh giá', 'opinion', 'ý kiến'];
+            const isSubjective = subjectiveKeywords.some(keyword => 
+                questionText.toLowerCase().includes(keyword)
+            );
+            
+            if (isSubjective) {
+                const positiveChoice = validChoices.find(choice => {
+                    const text = choice.textContent.toLowerCase();
+                    return text.includes('có') || text.includes('yes') || text.includes('đồng ý') ||
+                           text.includes('hài lòng') || text.includes('satisfied') || text.includes('tốt') ||
+                           text.includes('thích') || text.includes('rất') || text.includes('excellent');
+                });
+                
+                if (positiveChoice) {
+                    this.log(`   Selected positive answer: ${positiveChoice.textContent.trim()}`);
+                    return [positiveChoice];
+                }
+            }
+        }
+        
+        // Smart strategy selection
+        const strategy = this.settings.radioStrategy || 'smart';
+        switch (strategy) {
+            case 'first':
+                return [validChoices[0]];
+            case 'smart':
+                // Avoid obviously negative answers
+                const nonNegativeChoices = validChoices.filter(choice => {
+                    const text = choice.textContent.toLowerCase();
+                    return !text.includes('không') && !text.includes('no') && 
+                           !text.includes('never') && !text.includes('không bao giờ') &&
+                           !text.includes('disagree') && !text.includes('không đồng ý');
+                });
+                
+                if (nonNegativeChoices.length > 0) {
+                    return [nonNegativeChoices[Math.floor(Math.random() * nonNegativeChoices.length)]];
+                }
+                // Fall through to random if no non-negative found
+            case 'random':
+            default:
+                return [validChoices[Math.floor(Math.random() * validChoices.length)]];
+        }
+        } // Close the special questions check
+    }
+
+    // General smart selection fallback
+    selectSmartChoice(validChoices, questionText) {
+        this.log('📋 Applying general smart selection...');
+        
+        // Default to radio selection logic for unknown question types
+        return this.selectRadioChoice(validChoices, questionText);
+    }
+
+    // Enhanced simulateClick method from successful console script
+    async simulateClick(element) {
+        // Scroll element into view first
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await this.delay(100, 200);
+        
+        // Debug: Log element details
+        this.log(`🔍 Attempting to click element: ${element.textContent.trim()}`);
+        
+        let success = false;
+        
+        // Method 1: Try finding and clicking the hidden radio input first
+        try {
+            const radioInput = element.querySelector('input[type="radio"]');
+            if (radioInput && !radioInput.disabled) {
+                this.log(`🎯 Found radio input, clicking directly`);
+                radioInput.checked = true;
+                radioInput.dispatchEvent(new Event('change', { bubbles: true }));
+                radioInput.dispatchEvent(new Event('click', { bubbles: true }));
+                await this.delay(100, 200);
+                success = await this.verifySelection(element);
+                if (success) {
+                    this.log(`✅ Radio input click successful`);
+                    return true;
+                }
+            }
+        } catch (e) {
+            this.log(`Radio input click failed: ${e.message}`, 'warning');
+        }
+        
+        // Method 2: Direct click on the choice item
+        try {
+            this.log(`🖱️ Trying direct element click`);
+            element.click();
+            await this.delay(150, 300);
+            success = await this.verifySelection(element);
+            if (success) {
+                this.log(`✅ Direct click successful`);
+                return true;
+            }
+        } catch (e) {
+            this.log(`Direct click failed: ${e.message}`, 'warning');
+        }
+        
+        // Method 3: Click on specific child elements
+        try {
+            const clickableChildren = element.querySelectorAll('span, div, label');
+            for (const child of clickableChildren) {
+                if (child.textContent.trim()) {
+                    this.log(`🎯 Trying child element: ${child.tagName}`);
+                    child.click();
+                    await this.delay(100, 200);
+                    success = await this.verifySelection(element);
+                    if (success) {
+                        this.log(`✅ Child element click successful`);
+                        return true;
+                    }
+                }
+            }
+        } catch (e) {
+            this.log(`Child element click failed: ${e.message}`, 'warning');
+        }
+        
+        // Method 4: MouseEvent simulation with coordinates
+        try {
+            this.log(`🖱️ Trying MouseEvent simulation`);
+            const rect = element.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            
+            element.dispatchEvent(new MouseEvent('mousedown', { 
+                bubbles: true, 
+                cancelable: true,
+                clientX: centerX,
+                clientY: centerY
+            }));
+            await this.delay(20, 50);
+            element.dispatchEvent(new MouseEvent('mouseup', { 
+                bubbles: true, 
+                cancelable: true,
+                clientX: centerX,
+                clientY: centerY
+            }));
+            element.dispatchEvent(new MouseEvent('click', { 
+                bubbles: true, 
+                cancelable: true,
+                clientX: centerX,
+                clientY: centerY
+            }));
+            await this.delay(150, 300);
+            success = await this.verifySelection(element);
+            if (success) {
+                this.log(`✅ MouseEvent simulation successful`);
+                return true;
+            }
+        } catch (e) {
+            this.log(`MouseEvent simulation failed: ${e.message}`, 'warning');
+        }
+        
+        // Method 5: Focus and keyboard interaction
+        try {
+            this.log(`⌨️ Trying keyboard interaction`);
+            element.focus();
+            await this.delay(50, 100);
+            element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+            element.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', bubbles: true, cancelable: true }));
+            element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true, cancelable: true }));
+            await this.delay(150, 300);
+            success = await this.verifySelection(element);
+            if (success) {
+                this.log(`✅ Keyboard interaction successful`);
+                return true;
+            }
+        } catch (e) {
+            this.log(`Keyboard interaction failed: ${e.message}`, 'warning');
+        }
+        
+        // Method 6: Try clicking parent or grandparent
+        try {
+            const parent = element.parentElement;
+            const grandparent = parent?.parentElement;
+            
+            for (const target of [parent, grandparent]) {
+                if (target && target !== element) {
+                    this.log(`🎯 Trying parent/grandparent: ${target.tagName}`);
+                    target.click();
+                    await this.delay(100, 200);
+                    success = await this.verifySelection(element);
+                    if (success) {
+                        this.log(`✅ Parent/grandparent click successful`);
+                        return true;
+                    }
+                }
+            }
+        } catch (e) {
+            this.log(`Parent/grandparent click failed: ${e.message}`, 'warning');
+        }
+        
+        this.log(`❌ All click methods failed for: ${element.textContent.trim()}`, 'error');
+        return false;
+    }
+
+    async verifySelection(element) {
+        // Wait a moment for UI to update
+        await this.delay(50, 100);
+        
+        // Multiple verification methods
+        const checks = [];
+        
+        // Check 1: aria-checked attribute
+        const ariaChecked = element.getAttribute('aria-checked') === 'true';
+        checks.push({ method: 'aria-checked', result: ariaChecked });
+        
+        // Check 2: Various selection classes
+        const hasSelectionClass = element.classList.contains('selected') ||
+                                element.classList.contains('is-checked') ||
+                                element.classList.contains('is-selected') ||
+                                element.classList.contains('active') ||
+                                element.classList.contains('checked');
+        checks.push({ method: 'selection-class', result: hasSelectionClass });
+        
+        // Check 3: Radio input checked state
+        const radioInput = element.querySelector('input[type="radio"]');
+        const radioChecked = radioInput?.checked || false;
+        checks.push({ method: 'radio-checked', result: radioChecked });
+        
+        // Check 4: Data attributes
+        const dataSelected = element.getAttribute('data-selected') === 'true' ||
+                           element.getAttribute('data-checked') === 'true';
+        checks.push({ method: 'data-attributes', result: dataSelected });
+        
+        // Check 5: Visual indicators (background color, etc.)
+        const computedStyle = window.getComputedStyle(element);
+        const hasVisualSelection = computedStyle.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+                                 computedStyle.backgroundColor !== 'transparent' &&
+                                 computedStyle.backgroundColor !== 'rgb(255, 255, 255)';
+        checks.push({ method: 'visual-style', result: hasVisualSelection });
+        
+        // Return true if any check is positive
+        const positiveChecks = checks.filter(check => check.result);
+        const isSelected = positiveChecks.length > 0;
+        
+        if (isSelected) {
+            this.log(`✅ Selection verified via: ${positiveChecks.map(c => c.method).join(', ')}`);
+        }
+        
+        return isSelected;
+    }
+
+    // Enhanced Likert table filling
+    async fillLikertTable(questionElement, likertTable) {
+        let filled = 0;
+        
+        this.log(`🔍 Processing Likert table`);
+        
+        // Find all rows in the Likert table
+        const tableRows = likertTable.querySelectorAll('tr[role="radiogroup"]');
+        this.log(`Found ${tableRows.length} Likert scale rows to fill`);
+        
+        if (tableRows.length === 0) {
+            // Try alternative row selectors
+            const altRows = likertTable.querySelectorAll('tr');
+            this.log(`🔍 No radiogroup rows found, trying all tr elements: ${altRows.length}`);
+        }
+        
+        for (const row of tableRows) {
+            try {
+                // Get the statement text for this row
+                const statementElement = row.querySelector('[data-automation-id="likerStatementTd"]');
+                const statementText = statementElement ? statementElement.textContent.trim() : 'Unknown statement';
+                
+                this.log(`📋 Processing Likert row: ${statementText.substring(0, 60)}...`);
+                
+                // Find all radio inputs in this row
+                let radioInputs = row.querySelectorAll('input[type="radio"][data-automation-id="radio"]');
+                
+                if (radioInputs.length === 0) {
+                    // Try alternative selectors
+                    radioInputs = row.querySelectorAll('input[type="radio"]');
+                    this.log(`🔍 Using fallback selector, found ${radioInputs.length} radio inputs`);
+                }
+                
+                if (radioInputs.length === 0) {
+                    this.log(`⚠️ No radio inputs found in row`, 'warning');
+                    continue;
+                }
+                
+                this.log(`Found ${radioInputs.length} rating options (1-${radioInputs.length})`);
+                
+                // Select high rating based on position (last 2 options typically represent 4-5 ratings)
+                const totalOptions = radioInputs.length;
+                const highPositionCount = Math.min(2, totalOptions);
+                const targetInputs = Array.from(radioInputs).slice(-highPositionCount);
+                
+                this.log(`🎯 Using positional selection: last ${highPositionCount} out of ${totalOptions} options as high ratings`);
+                
+                // Randomly select from target inputs (weighted toward higher)
+                let selectedInput;
+                if (targetInputs.length === 1) {
+                    selectedInput = targetInputs[0];
+                } else {
+                    // Weighted selection favoring the last option (highest rating)
+                    const weights = targetInputs.map((_, index) => Math.pow(2, index + 1));
+                    const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+                    let random = Math.random() * totalWeight;
+                    
+                    for (let i = weights.length - 1; i >= 0; i--) {
+                        random -= weights[i];
+                        if (random <= 0) {
+                            selectedInput = targetInputs[i];
+                            break;
+                        }
+                    }
+                    
+                    if (!selectedInput) {
+                        selectedInput = targetInputs[targetInputs.length - 1]; // fallback to highest
+                    }
+                }
+                
+                const ariaLabel = selectedInput.getAttribute('aria-label');
+                const value = selectedInput.value;
+                const displayValue = ariaLabel || value || 'unknown';
+                
+                this.log(`🎯 Selecting rating: ${displayValue} for "${statementText.substring(0, 40)}..."`);
+                
+                // Click the selected radio input
+                let attempts = 0;
+                let success = false;
+                const maxAttempts = 3;
+                
+                while (!success && attempts < maxAttempts) {
+                    attempts++;
+                    this.log(`🔄 Likert attempt ${attempts}/${maxAttempts} for rating ${displayValue}`);
+                    
+                    try {
+                        // Scroll into view
+                        selectedInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        await this.delay(100, 200);
+                        
+                        // Direct radio input manipulation
+                        selectedInput.checked = true;
+                        selectedInput.dispatchEvent(new Event('change', { bubbles: true }));
+                        selectedInput.dispatchEvent(new Event('click', { bubbles: true }));
+                        
+                        await this.delay(100, 200);
+                        
+                        // Verify selection
+                        if (selectedInput.checked) {
+                            this.log(`✅ Likert selection successful: rating ${displayValue}`);
+                            success = true;
+                            filled++;
+                        } else {
+                            // Try alternative methods
+                            const label = selectedInput.closest('label');
+                            if (label) {
+                                label.click();
+                                await this.delay(100, 200);
+                                if (selectedInput.checked) {
+                                    this.log(`✅ Likert label click successful: ${displayValue}`);
+                                    success = true;
+                                    filled++;
+                                }
+                            }
+                        }
+                        
+                        if (!success && attempts < maxAttempts) {
+                            await this.delay(300, 500);
+                        }
+                        
+                    } catch (error) {
+                        this.log(`❌ Error in Likert attempt ${attempts}: ${error.message}`, 'error');
+                    }
+                }
+                
+                if (!success) {
+                    this.log(`❌ Failed to select Likert rating after ${maxAttempts} attempts`, 'error');
+                }
+                
+                // Delay between row selections
+                await this.delay(100, 200);
+                
+            } catch (error) {
+                this.log(`❌ Error processing Likert row: ${error.message}`, 'error');
+            }
+        }
+        
+        return filled;
+    }
+
+    // Enhanced text field filling
+    async fillTextFields() {
+        const textSelectors = [
+            'input[type="text"]',
+            'input[type="email"]', 
+            'input[type="tel"]',
+            'input[type="number"]',
+            'textarea',
+            '[contenteditable="true"]',
+            '[role="textbox"]'
+        ];
+        
+        let filled = 0;
+        
+        for (const selector of textSelectors) {
+            const fields = document.querySelectorAll(selector);
+            
+            for (const field of fields) {
+                if (!this.isElementVisible(field) || 
+                    (field.value && field.value.trim()) ||
+                    (field.textContent && field.textContent.trim())) {
+                    continue;
+                }
+                
+                // Generate appropriate text based on field context
+                let text = this.generateContextualText(field);
+                
+                if (text) {
+                    try {
+                        field.focus();
+                        
+                        // Clear existing content
+                        if (field.tagName === 'INPUT' || field.tagName === 'TEXTAREA') {
+                            field.value = text;
+                        } else {
+                            field.textContent = text;
+                        }
+                        
+                        field.dispatchEvent(new Event('input', { bubbles: true }));
+                        field.dispatchEvent(new Event('change', { bubbles: true }));
+                        field.blur();
+                        
+                        filled++;
+                        this.log(`Filled text field: ${text.substring(0, 30)}...`);
+                        
+                        await this.delay(50, 100);
+                        
+                    } catch (error) {
+                        this.log(`Error filling text field: ${error.message}`, 'error');
+                    }
+                }
+            }
+        }
+        
+        return filled;
+    }
+
+    generateContextualText(field) {
+        const context = (field.placeholder || field.getAttribute('aria-label') || '').toLowerCase();
+        const questionElement = field.closest('[data-automation-id="questionItem"]');
+        const questionText = questionElement ? this.getQuestionText(questionElement).toLowerCase() : '';
+        
+        const combined = context + ' ' + questionText;
+        const language = this.settings.textLanguage || 'vi';
+        
+        // Vietnamese responses
+        if (language === 'vi') {
+            if (combined.includes('name') || combined.includes('tên') || combined.includes('họ và tên')) {
+                const names = ['Nguyễn Văn An', 'Trần Thị Bình', 'Lê Minh Châu', 'Phạm Thu Dung', 'Hoàng Văn Em'];
+                return names[Math.floor(Math.random() * names.length)];
+            } else if (combined.includes('email') || combined.includes('thư điện tử')) {
+                const domains = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com'];
+                const domain = domains[Math.floor(Math.random() * domains.length)];
+                return `user${Math.floor(Math.random() * 9999)}@${domain}`;
+            } else if (combined.includes('phone') || combined.includes('điện thoại')) {
+                const prefixes = ['098', '097', '096', '086', '083', '084', '085', '088'];
+                const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+                return `${prefix}${Math.floor(Math.random() * 10000000).toString().padStart(7, '0')}`;
+            } else if (combined.includes('age') || combined.includes('tuổi')) {
+                return Math.floor(Math.random() * 45 + 18).toString();
+            } else if (combined.includes('feedback') || combined.includes('comment') || combined.includes('ý kiến')) {
+                const feedback = [
+                    'Dịch vụ rất tốt, tôi hoàn toàn hài lòng.',
+                    'Chất lượng sản phẩm vượt mong đợi.',
+                    'Nhân viên phục vụ nhiệt tình và chu đáo.',
+                    'Trải nghiệm tuyệt vời, sẽ quay lại lần sau.',
+                    'Giá cả hợp lý, chất lượng đảm bảo.'
+                ];
+                return feedback[Math.floor(Math.random() * feedback.length)];
+            }
+            
+            // Default Vietnamese responses
+            const defaults = [
+                'Tôi đồng ý với điều này.',
+                'Rất hài lòng với chất lượng.',
+                'Sản phẩm/dịch vụ tuyệt vời.',
+                'Đáp ứng tốt nhu cầu của tôi.'
+            ];
+            return defaults[Math.floor(Math.random() * defaults.length)];
+        } else {
+            // English responses
+            if (combined.includes('name')) {
+                const names = ['John Smith', 'Jane Doe', 'Michael Johnson', 'Sarah Wilson'];
+                return names[Math.floor(Math.random() * names.length)];
+            } else if (combined.includes('email')) {
+                const domains = ['gmail.com', 'yahoo.com', 'hotmail.com'];
+                const domain = domains[Math.floor(Math.random() * domains.length)];
+                return `user${Math.floor(Math.random() * 9999)}@${domain}`;
+            } else if (combined.includes('feedback') || combined.includes('comment')) {
+                const feedback = [
+                    'Excellent service, highly satisfied.',
+                    'Great quality, exceeded expectations.',
+                    'Professional and friendly staff.',
+                    'Outstanding experience overall.'
+                ];
+                return feedback[Math.floor(Math.random() * feedback.length)];
+            }
+            
+            // Default English responses
+            const defaults = [
+                'I agree with this.',
+                'Very satisfied with the quality.',
+                'Excellent product/service.',
+                'Meets my needs perfectly.'
+            ];
+            return defaults[Math.floor(Math.random() * defaults.length)];
+        }
+    }
+
+    // Check for validation errors
+    checkValidationErrors() {
+        const errorSelectors = [
+            '[role="alert"]',
+            '[data-automation-id="validationError"]',
+            '[data-automation-id="submitError"]'
+        ];
+        
+        const errors = [];
+        errorSelectors.forEach(selector => {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+                if (this.isElementVisible(el) && el.textContent.trim()) {
+                    errors.push(el.textContent.trim());
+                }
+            });
+        });
+        
+        return errors;
+    }
+
+    // Find and click next/submit button
+    async proceedToNext() {
+        this.log('🔍 Looking for navigation buttons...');
+        
+        // Priority order: Next button first, then Submit button
+        const buttonSelectors = [
+            { selector: '[data-automation-id="nextButton"]', type: 'next' },
+            { selector: 'button[aria-label*="Next"]', type: 'next' },
+            { selector: '[data-automation-id="submitButton"]', type: 'submit' },
+            { selector: 'button[type="submit"]', type: 'submit' },
+            { selector: 'button[aria-label*="Submit"]', type: 'submit' }
+        ];
+        
+        // Also search by text content
+        const textSearches = [
+            { text: 'Next', type: 'next' },
+            { text: 'Tiếp', type: 'next' },
+            { text: 'Continue', type: 'next' },
+            { text: 'Submit', type: 'submit' },
+            { text: 'Gửi', type: 'submit' },
+            { text: 'Hoàn thành', type: 'submit' }
+        ];
+        
+        // First try selector-based search
+        for (const { selector, type } of buttonSelectors) {
+            const button = document.querySelector(selector);
+            if (button && this.isElementClickable(button)) {
+                this.log(`Found ${type} button via selector: ${button.textContent.trim()}`);
+                return await this.clickNavigationButton(button, type);
+            }
+        }
+        
+        // Then try text-based search
+        const allButtons = document.querySelectorAll('button');
+        for (const { text, type } of textSearches) {
+            const button = Array.from(allButtons).find(btn => 
+                btn.textContent.toLowerCase().includes(text.toLowerCase()) && 
+                this.isElementClickable(btn)
+            );
+            
+            if (button) {
+                this.log(`Found ${type} button via text: ${button.textContent.trim()}`);
+                return await this.clickNavigationButton(button, type);
+            }
+        }
+        
+        this.log('❌ No navigation buttons found', 'warning');
+        return false;
+    }
+
+    async clickNavigationButton(button, type) {
+        try {
+            this.log(`🎯 Clicking ${type} button: "${button.textContent.trim()}"`);
+            
+            // Scroll to button and wait
+            button.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.delay(500, 800);
+            
+            // Click the button
+            button.click();
+            
+            if (type === 'next') {
+                // For next button, prepare for new page
+                this.log('📄 Navigating to next page...');
+                
+                // Reset state for new page
+                this.processedQuestions.clear();
+                
+                // Wait for page transition
+                await this.delay(1000, 1500);
+                
+                return true;
+            } else if (type === 'submit') {
+                // For submit button, handle submission
+                this.submissionCount++;
+                this.log('🎉 Form submitted successfully!', 'success');
+                this.sendStatusToPopup(`Đã gửi form thành công! (${this.submissionCount})`, 'success');
+                
+                // Check if we should submit another response
+                if (this.settings.autoSubmitAnother && 
+                    (this.settings.maxFormSubmissions === 0 || this.submissionCount < this.settings.maxFormSubmissions)) {
+                    
+                    this.log(`🔄 Auto-submit another enabled. Submission ${this.submissionCount}/${this.settings.maxFormSubmissions === 0 ? '∞' : this.settings.maxFormSubmissions}`);
+                    
+                    // Wait for submit confirmation page to load
+                    await this.delay(2000, 3000);
+                    
+                    // Look for "Submit another response" button
+                    const submitAnotherSuccess = await this.clickSubmitAnother();
+                    if (submitAnotherSuccess) {
+                        this.log('🔄 Starting new form cycle...', 'success');
+                        // Reset state for new form (but keep submission count)
+                        this.processedQuestions.clear();
+                        this.totalFilled = 0;
+                        
+                        // Continue the filling loop
+                        return true;
+                    } else {
+                        this.log('ℹ️ Submit another response button not found - stopping auto-repeat', 'warning');
+                        return false;
+                    }
+                } else if (this.settings.maxFormSubmissions > 0 && this.submissionCount >= this.settings.maxFormSubmissions) {
+                    this.log(`🏁 Reached maximum form submissions (${this.settings.maxFormSubmissions}). Stopping.`, 'success');
+                    return false;
+                } else {
+                    this.log('ℹ️ Auto-submit another disabled in config', 'info');
+                    return false;
+                }
+            }
+            
+        } catch (error) {
+            this.log(`Error clicking ${type} button: ${error.message}`, 'error');
+            return false;
+        }
+        
+        return false;
+    }
+
+    // Find and click "Submit another response" button
+    async clickSubmitAnother() {
+        this.log('🔍 Looking for "Submit another response" button...');
+        
+        // Try to find the span with data-automation-id="submitAnother" first
+        let submitAnotherSpan = document.querySelector('span[data-automation-id="submitAnother"]');
+        
+        if (submitAnotherSpan && this.isElementVisible(submitAnotherSpan)) {
+            this.log('🎯 Found submit another span element');
+            
+            // Find the clickable parent - should be div with role="link" and tabindex="0"
+            let clickableParent = submitAnotherSpan.closest('div[role="link"][tabindex="0"]');
+            
+            if (!clickableParent) {
+                // Try alternative parent patterns
+                clickableParent = submitAnotherSpan.closest('div[tabindex="0"]') ||
+                                 submitAnotherSpan.closest('div[role="link"]') ||
+                                 submitAnotherSpan.closest('div[class*="-hw-"]') ||
+                                 submitAnotherSpan.parentElement;
+            }
+            
+            if (clickableParent && this.isElementVisible(clickableParent)) {
+                this.log(`✅ Found clickable parent: ${clickableParent.tagName} with classes: ${clickableParent.className}`);
+                return await this.performSubmitAnotherClick(clickableParent);
+            } else {
+                this.log('⚠️ Clickable parent not found, trying to click span directly');
+                return await this.performSubmitAnotherClick(submitAnotherSpan);
+            }
+        }
+        
+        // Fallback: Multiple selectors to find the submit another button
+        const selectors = [
+            'div[class*="-hw-"][tabindex="0"][role="link"] span[data-automation-id="submitAnother"]',
+            'div[tabindex="0"][role="link"] span[data-automation-id="submitAnother"]',
+            'div[class*="hw-"] span[data-automation-id="submitAnother"]',
+            '[data-automation-id="submitAnother"]'
+        ];
+        
+        // Also search by text content
+        const textSearches = [
+            'Submit another response',
+            'Gửi phản hồi khác',
+            'Submit another',
+            'Gửi thêm'
+        ];
+        
+        // Try selector-based search
+        for (const selector of selectors) {
+            const element = document.querySelector(selector);
+            if (element && this.isElementVisible(element)) {
+                this.log(`🔍 Found element via selector: ${selector}`);
+                
+                // If it's the span, get the parent
+                let clickableElement = element;
+                if (element.tagName === 'SPAN') {
+                    clickableElement = element.closest('div[role="link"]') || 
+                                     element.closest('div[tabindex="0"]') || 
+                                     element.parentElement;
+                }
+                
+                if (!this.isElementClickable(clickableElement)) {
+                    // Try parent elements
+                    clickableElement = clickableElement.closest('div[role="link"]') || 
+                                     clickableElement.closest('div[tabindex="0"]') || 
+                                     clickableElement.parentElement;
+                }
+                
+                if (clickableElement && this.isElementVisible(clickableElement)) {
+                    this.log(`✅ Found submit another button via selector: ${selector}`);
+                    return await this.performSubmitAnotherClick(clickableElement);
+                }
+            }
+        }
+        
+        // Try text-based search
+        const allElements = document.querySelectorAll('div, span, button, a');
+        for (const text of textSearches) {
+            const element = Array.from(allElements).find(el => 
+                el.textContent.toLowerCase().includes(text.toLowerCase()) && 
+                this.isElementVisible(el)
+            );
+            
+            if (element) {
+                let clickableElement = element;
+                if (!this.isElementClickable(element)) {
+                    clickableElement = element.closest('div[role="link"]') || 
+                                     element.closest('div[tabindex="0"]') || 
+                                     element.parentElement;
+                }
+                
+                if (clickableElement && this.isElementVisible(clickableElement)) {
+                    this.log(`✅ Found submit another button via text: "${text}"`);
+                    return await this.performSubmitAnotherClick(clickableElement);
+                }
+            }
+        }
+        
+        this.log('❌ Submit another response button not found', 'warning');
+        return false;
+    }
+
+    async performSubmitAnotherClick(element) {
+        this.log(`🔄 Attempting to click submit another button: ${element.tagName}.${element.className}`);
+        
+        // Store the element info for debugging
+        const elementInfo = {
+            tagName: element.tagName,
+            className: element.className,
+            id: element.id,
+            role: element.getAttribute('role'),
+            tabindex: element.getAttribute('tabindex'),
+            text: element.textContent?.trim()
+        };
+        
+        this.log(`📋 Element info: ${JSON.stringify(elementInfo)}`);
+        
+        // Scroll element into view
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await this.sleep(500);
+        
+        // Method 1: Direct click
+        try {
+            this.log('🔄 Method 1: Direct click');
+            element.click();
+            await this.sleep(1500);
+            
+            // Check if we're back to the form (indicating success)
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful - back to form');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 1 failed: ${error.message}`);
+        }
+        
+        // Method 2: Mouse event
+        try {
+            this.log('🔄 Method 2: Mouse event');
+            const rect = element.getBoundingClientRect();
+            const clickEvent = new MouseEvent('click', {
+                view: window,
+                bubbles: true,
+                cancelable: true,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2
+            });
+            element.dispatchEvent(clickEvent);
+            await this.sleep(1500);
+            
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful via mouse event');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 2 failed: ${error.message}`);
+        }
+        
+        // Method 3: Keyboard activation
+        try {
+            this.log('🔄 Method 3: Keyboard activation');
+            element.focus();
+            await this.sleep(200);
+            
+            const enterEvent = new KeyboardEvent('keydown', {
+                key: 'Enter',
+                code: 'Enter',
+                keyCode: 13,
+                bubbles: true,
+                cancelable: true
+            });
+            element.dispatchEvent(enterEvent);
+            await this.sleep(1500);
+            
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful via keyboard');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 3 failed: ${error.message}`);
+        }
+        
+        // Method 4: Try clicking child span if exists
+        try {
+            this.log('🔄 Method 4: Looking for child span element');
+            const childSpan = element.querySelector('span[data-automation-id="submitAnother"]');
+            if (childSpan) {
+                this.log('🎯 Found child span element, clicking it');
+                childSpan.click();
+                await this.sleep(1500);
+                
+                if (this.isBackToForm()) {
+                    this.log('✅ Submit another successful via child span');
+                    return true;
+                }
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 4 failed: ${error.message}`);
+        }
+        
+        this.log('❌ All submit another click methods failed');
+        return false;
+    }
+    
+    isBackToForm() {
+        // Check if we're back to the form by looking for form elements
+        const formIndicators = [
+            '[data-automation-id="questionItem"]',
+            'input[type="radio"]',
+            'input[type="checkbox"]',
+            'input[type="text"]',
+            'textarea',
+            'select',
+            '.office-form-question',
+            '[role="radiogroup"]'
+        ];
+        
+        for (const selector of formIndicators) {
+            if (document.querySelector(selector)) {
+                return true;
+            }
+        }
+        
+        // Also check if we're no longer on a "thank you" or completion page
+        const completionIndicators = [
+            'Your response has been recorded',
+            'Thank you',
+            'Cảm ơn bạn',
+            'Đã ghi lại phản hồi',
+            'response has been submitted'
+        ];
+        
+        const pageText = document.body.textContent?.toLowerCase() || '';
+        const hasCompletionText = completionIndicators.some(text => 
+            pageText.includes(text.toLowerCase())
+        );
+        
+        return !hasCompletionText;
+    }
+}
+
+// Initialize the content script
+console.log('🔍 QuickFill: Initializing on URL:', window.location.href);
+window.quickFillFormsV2Instance = new QuickFillFormsV2();
+console.log('🚀 QuickFill: Instance created and stored');

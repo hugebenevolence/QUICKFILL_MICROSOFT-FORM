@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "QuickFill Microsoft Forms",
+  "version": "2.0.0",
+  "description": "Tự động điền Microsoft Forms với cấu hình linh hoạt và tùy chỉnh",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://forms.office.com/*",
+    "https://forms.microsoft.com/*",
+    "https://*.forms.office.com/*",
+    "https://*.forms.microsoft.com/*",
+    "https://forms.office365.com/*",
+    "https://generativelanguage.googleapis.com/*",
+    "https://forms.cloud.microsoft/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "QuickFill Microsoft Forms",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://forms.office.com/*",
+        "https://forms.microsoft.com/*",
+        "https://*.forms.office.com/*",
+        "https://*.forms.microsoft.com/*",
+        "https://forms.office365.com/*",
+        "https://forms.cloud.microsoft/*"
+      ],
+      "js": ["content-v2.1.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
