@@ -5,13 +5,22 @@ class PopupController {
     constructor() {
         this.currentTab = 'basic';
         this.isRunning = false;
+        this.sessionStartTime = null;
+        this.statsUpdateInterval = null;
+        this.currentStats = {
+            submitCount: 0,
+            sessionDuration: 0,
+            isRunning: false
+        };
         this.init();
     }
 
     async init() {
         this.setupEventListeners();
+        this.setupStatusListener();
         await this.loadSettings();
         this.updateUI();
+        this.initializeStatistics();
     }
 
     setupEventListeners() {
@@ -561,6 +570,79 @@ class PopupController {
         });
         return questions;
     }
+
+    setupStatusListener() {
+        // Listen for status updates from content script
+        chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+            if (message.action === 'statusUpdate') {
+                this.updateStatistics(message.data);
+            }
+        });
+    }
+
+    initializeStatistics() {
+        // Show statistics section if it exists
+        const statsElement = document.getElementById('statistics');
+        if (statsElement) {
+            statsElement.style.display = 'block';
+        }
+        
+        // Initialize with default values
+        this.updateStatistics({
+            submitCount: 0,
+            sessionDuration: 0,
+            isRunning: false
+        });
+    }
+
+    updateStatistics(data) {
+        // Update submit count
+        const submitCountElement = document.getElementById('submitCount');
+        if (submitCountElement && data.submitCount !== undefined) {
+            submitCountElement.textContent = data.submitCount;
+            submitCountElement.style.color = data.submitCount > 0 ? '#38a169' : '#718096';
+        }
+
+        // Update session duration
+        const durationElement = document.getElementById('sessionDuration');
+        if (durationElement && data.sessionDuration !== undefined) {
+            const minutes = Math.floor(data.sessionDuration / 60000);
+            const seconds = Math.floor((data.sessionDuration % 60000) / 1000);
+            durationElement.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        }
+
+        // Update running status
+        const statusElement = document.getElementById('runningStatus');
+        if (statusElement && data.isRunning !== undefined) {
+            if (data.isRunning) {
+                statusElement.textContent = 'Đang chạy';
+                statusElement.className = 'stat-value status-running';
+            } else {
+                statusElement.textContent = data.submitCount > 0 ? 'Hoàn thành' : 'Đang chờ';
+                statusElement.className = 'stat-value status-idle';
+            }
+        }
+
+        // Show statistics section
+        const statsElement = document.getElementById('statistics');
+        if (statsElement && (data.submitCount > 0 || data.isRunning)) {
+            statsElement.style.display = 'block';
+        }
+    }
+
+    resetStatistics() {
+        this.updateStatistics({
+            submitCount: 0,
+            sessionDuration: 0,
+            isRunning: false
+        });
+        
+        // Hide statistics if no activity
+        const statsElement = document.getElementById('statistics');
+        if (statsElement) {
+            statsElement.style.display = 'none';
+        }
+    }
 }
 
 // Global functions for HTML onclick handlers
@@ -585,6 +667,9 @@ function removeQuestion(button) {
         }
     }
 }
+
+
+
 
 // Initialize popup when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {

@@ -14,6 +14,8 @@ class QuickFillFormsV2 {
         this.sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
         this.currentFormData = {};
         this.processedQuestions = new Set(); // Track processed questions per page
+        this.submitCount = 0; // Counter for submitted forms
+        this.sessionStartTime = Date.now(); // Track session start
         this.setupMessageListener();
         this.log('🎯 QuickFill v2.1 initialized');
     }
@@ -23,6 +25,34 @@ class QuickFillFormsV2 {
         const timestamp = new Date().toLocaleTimeString();
         const prefix = type === 'error' ? '❌' : type === 'warning' ? '⚠️' : type === 'success' ? '✅' : '🔍';
         console.log(`${prefix} [${timestamp}] QuickFill: ${message}`);
+    }
+
+    updateSubmitCount(increment = true) {
+        if (increment) {
+            this.submitCount++;
+            this.log(`📊 Form submitted! Total: ${this.submitCount}`, 'success');
+        }
+        
+        // Send update to popup
+        this.sendStatusUpdate({
+            submitCount: this.submitCount,
+            sessionDuration: Date.now() - this.sessionStartTime,
+            isRunning: this.isRunning
+        });
+    }
+
+    sendStatusUpdate(status) {
+        try {
+            chrome.runtime.sendMessage({
+                action: 'statusUpdate',
+                data: status
+            }).catch(error => {
+                // Popup might be closed, ignore error
+                this.log(`Status update failed (popup likely closed): ${error.message}`);
+            });
+        } catch (error) {
+            this.log(`Error sending status update: ${error.message}`);
+        }
     }
 
     setupMessageListener() {
@@ -762,7 +792,7 @@ class QuickFillFormsV2 {
             
             const inputs = element.querySelectorAll('input, textarea, select');
             this.log(`   - Input elements: ${inputs.length}`);
-            inputs.forEach((input, index) => {
+            this.ensureArray(inputs).forEach((input, index) => {
                 this.log(`     ${index + 1}. ${input.tagName}[type="${input.type || 'N/A'}"] - ${input.name || input.id || 'unnamed'}`);
             });
             
@@ -1422,7 +1452,7 @@ class QuickFillFormsV2 {
             const settingsMax = this.currentFormData.ratingMax || 5;
             this.log(`🎯 Detected rating/Likert scale - using rating strategy with range ${settingsMin}-${settingsMax}`);
             
-            selectedInput = this.selectRatingFromInputsPositional(visibleInputs, settingsMin, settingsMax);
+            selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(visibleInputs), settingsMin, settingsMax);
             
             if (selectedInput) {
                 const selectedRating = Array.from(visibleInputs).indexOf(selectedInput) + 1;
@@ -1532,7 +1562,8 @@ class QuickFillFormsV2 {
         
         this.log(`🔍 Analyzing ${inputs.length} inputs to avoid "other" options`);
         
-        const preferredInputs = inputs.filter(input => {
+        const inputsArray = this.ensureArray(inputs);
+        const preferredInputs = inputsArray.filter(input => {
             const label = this.getInputLabel(input).toLowerCase();
             
             // Method 1: Check label text
@@ -2068,7 +2099,7 @@ class QuickFillFormsV2 {
                 });
                 
                 // Use position-based selection like console script
-                const selectedInput = this.selectRatingFromInputsPositional(radioInputs, settingsMin, settingsMax);
+                const selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(radioInputs), settingsMin, settingsMax);
                 
                 if (selectedInput) {
                     // Get display information
@@ -2101,12 +2132,15 @@ class QuickFillFormsV2 {
     }
 
     selectRatingFromInputsPositional(inputs, settingsMin, settingsMax) {
-        if (inputs.length === 0) return null;
+        if (!inputs || inputs.length === 0) return null;
         
-        this.log(`🔍 ENHANCED rating analysis for user range ${settingsMin}-${settingsMax} from ${inputs.length} inputs:`);
+        // Convert NodeList to Array if needed - safe conversion
+        const inputsArray = this.ensureArray(inputs);
+        
+        this.log(`🔍 ENHANCED rating analysis for user range ${settingsMin}-${settingsMax} from ${inputsArray.length} inputs:`);
         
         // Enhanced input analysis with multiple detection strategies
-        const inputAnalysis = inputs.map((input, index) => {
+        const inputAnalysis = inputsArray.map((input, index) => {
             const analysis = {
                 input,
                 index,
@@ -2909,22 +2943,46 @@ class QuickFillFormsV2 {
     async clickSubmitAnother() {
         this.log('🔍 Waiting for success page and "Submit another response" button...');
         
+        // Update submit count when we reach the success page
+        this.updateSubmitCount(true);
+        
         // Wait for the success page to load after form submission
         await this.waitForSuccessPage();
         
-        // Try to find the span with data-automation-id="submitAnother" first
+        // Primary detection: Look for the exact structure you provided
+        const specificSelector = 'div[class*="-hw-"][tabindex="0"][role="link"]';
+        const candidateDivs = document.querySelectorAll(specificSelector);
+        
+        this.log(`🔍 Found ${candidateDivs.length} potential submit another divs with class pattern -hw-`);
+        
+        for (const div of candidateDivs) {
+            const span = div.querySelector('span[data-automation-id="submitAnother"]');
+            if (span) {
+                this.log(`✅ Found exact match: div with class "${div.className}" containing submitAnother span`);
+                this.log(`🎯 Div attributes: role="${div.getAttribute('role')}", tabindex="${div.getAttribute('tabindex')}"`);
+                this.log(`🎯 Span text: "${span.textContent}"`);
+                
+                if (this.isElementVisible(div)) {
+                    return await this.performSubmitAnotherClick(div);
+                } else {
+                    this.log('⚠️ Element not visible, continuing search...');
+                }
+            }
+        }
+        
+        // Fallback: Try to find the span first
         let submitAnotherSpan = document.querySelector('span[data-automation-id="submitAnother"]');
         
         if (submitAnotherSpan && this.isElementVisible(submitAnotherSpan)) {
-            this.log('🎯 Found submit another span element');
+            this.log('🎯 Found submit another span element as fallback');
             
-            // Find the clickable parent - should be div with role="link" and tabindex="0"
-            let clickableParent = submitAnotherSpan.closest('div[role="link"][tabindex="0"]');
+            // Find the clickable parent with the exact pattern
+            let clickableParent = submitAnotherSpan.closest('div[class*="-hw-"][tabindex="0"][role="link"]');
             
             if (!clickableParent) {
-                // Try alternative parent patterns
-                clickableParent = submitAnotherSpan.closest('div[tabindex="0"]') ||
-                                 submitAnotherSpan.closest('div[role="link"]') ||
+                // Try broader patterns
+                clickableParent = submitAnotherSpan.closest('div[role="link"][tabindex="0"]') ||
+                                 submitAnotherSpan.closest('div[tabindex="0"][role="link"]') ||
                                  submitAnotherSpan.closest('div[class*="-hw-"]') ||
                                  submitAnotherSpan.parentElement;
             }
@@ -2940,10 +2998,19 @@ class QuickFillFormsV2 {
         
         // Fallback: Multiple selectors to find the submit another button
         const selectors = [
+            // Match the exact structure you provided
             'div[class*="-hw-"][tabindex="0"][role="link"] span[data-automation-id="submitAnother"]',
             'div[tabindex="0"][role="link"] span[data-automation-id="submitAnother"]',
+            'div[role="link"][tabindex="0"] span[data-automation-id="submitAnother"]',
+            // Parent div selectors
+            'div[class*="-hw-"][tabindex="0"][role="link"]:has(span[data-automation-id="submitAnother"])',
+            'div[tabindex="0"][role="link"]:has(span[data-automation-id="submitAnother"])',
+            // Broader selectors
             'div[class*="hw-"] span[data-automation-id="submitAnother"]',
-            '[data-automation-id="submitAnother"]'
+            '[data-automation-id="submitAnother"]',
+            // CSS class pattern matching
+            'div[class*="-hw-"][role="link"]',
+            'div[class^="-hw-"][tabindex="0"]'
         ];
         
         // Also search by text content
@@ -2954,59 +3021,155 @@ class QuickFillFormsV2 {
             'Gửi thêm'
         ];
         
-        // Try selector-based search
+        // Try selector-based search with enhanced logic
         for (const selector of selectors) {
-            const element = document.querySelector(selector);
-            if (element && this.isElementVisible(element)) {
-                this.log(`🔍 Found element via selector: ${selector}`);
-                
-                // If it's the span, get the parent
-                let clickableElement = element;
-                if (element.tagName === 'SPAN') {
-                    clickableElement = element.closest('div[role="link"]') || 
-                                     element.closest('div[tabindex="0"]') || 
-                                     element.parentElement;
+            this.log(`🔍 Trying selector: ${selector}`);
+            const elements = document.querySelectorAll(selector);
+            this.log(`🔍 Found ${elements.length} elements with selector: ${selector}`);
+            
+            for (const element of elements) {
+                if (!this.isElementVisible(element)) {
+                    this.log(`⚠️ Element not visible, skipping: ${element.tagName}.${element.className}`);
+                    continue;
                 }
                 
-                if (!this.isElementClickable(clickableElement)) {
-                    // Try parent elements
-                    clickableElement = clickableElement.closest('div[role="link"]') || 
-                                     clickableElement.closest('div[tabindex="0"]') || 
-                                     clickableElement.parentElement;
+                this.log(`🔍 Found visible element: ${element.tagName}.${element.className}`);
+                
+                // If it's the span, get the parent div
+                let clickableElement = element;
+                if (element.tagName === 'SPAN' && element.getAttribute('data-automation-id') === 'submitAnother') {
+                    // Get the parent div with role="link"
+                    clickableElement = element.closest('div[role="link"][tabindex="0"]') || 
+                                     element.closest('div[tabindex="0"][role="link"]') || 
+                                     element.closest('div[class*="-hw-"]') ||
+                                     element.parentElement;
+                    
+                    this.log(`🎯 Span found, using parent: ${clickableElement?.tagName}.${clickableElement?.className}`);
+                }
+                
+                // Validate the clickable element
+                if (clickableElement && this.isElementVisible(clickableElement)) {
+                    // Additional validation for the exact structure
+                    const hasCorrectStructure = 
+                        clickableElement.getAttribute('role') === 'link' &&
+                        clickableElement.getAttribute('tabindex') === '0' &&
+                        clickableElement.querySelector('span[data-automation-id="submitAnother"]');
+                    
+                    if (hasCorrectStructure) {
+                        this.log(`✅ Found submit another button with correct structure via selector: ${selector}`);
+                        this.log(`🎯 Element: ${clickableElement.tagName}, class: ${clickableElement.className}, role: ${clickableElement.getAttribute('role')}`);
+                        return await this.performSubmitAnotherClick(clickableElement);
+                    } else {
+                        this.log(`⚠️ Element found but structure doesn't match expected pattern`);
+                    }
+                }
+            }
+        }
+        
+        // Try text-based search with enhanced detection
+        this.log('🔍 Trying text-based search for submit another button...');
+        const allInteractiveElements = document.querySelectorAll('div, span, button, a, [role="link"], [tabindex="0"]');
+        
+        for (const text of textSearches) {
+            this.log(`🔍 Searching for text: "${text}"`);
+            
+            const matchingElements = Array.from(allInteractiveElements).filter(el => {
+                const elementText = el.textContent?.toLowerCase().trim();
+                const searchText = text.toLowerCase();
+                return elementText && (
+                    elementText.includes(searchText) || 
+                    elementText === searchText ||
+                    elementText.replace(/\s+/g, ' ') === searchText
+                );
+            });
+            
+            this.log(`🔍 Found ${matchingElements.length} elements matching "${text}"`);
+            
+            for (const element of matchingElements) {
+                if (!this.isElementVisible(element)) {
+                    this.log(`⚠️ Element not visible: ${element.textContent?.substring(0, 30)}`);
+                    continue;
+                }
+                
+                let clickableElement = element;
+                
+                // Find the best clickable element
+                if (!this.isElementClickable(element)) {
+                    // Try to find clickable parent
+                    const potentialParents = [
+                        element.closest('div[role="link"]'),
+                        element.closest('div[tabindex="0"]'),
+                        element.closest('[role="link"]'),
+                        element.closest('[tabindex="0"]'),
+                        element.closest('div[class*="clickable"]'),
+                        element.closest('div[class*="button"]'),
+                        element.parentElement
+                    ].filter(Boolean);
+                    
+                    clickableElement = potentialParents.find(parent => 
+                        this.isElementClickable(parent) && this.isElementVisible(parent)
+                    ) || element;
                 }
                 
                 if (clickableElement && this.isElementVisible(clickableElement)) {
-                    this.log(`✅ Found submit another button via selector: ${selector}`);
+                    this.log(`✅ Found submit another button via text: "${text}" on element: ${clickableElement.tagName}`);
+                    this.log(`🎯 Element details: classes="${clickableElement.className}", role="${clickableElement.getAttribute('role')}", tabindex="${clickableElement.getAttribute('tabindex')}"`);
                     return await this.performSubmitAnotherClick(clickableElement);
                 }
             }
         }
         
-        // Try text-based search
-        const allElements = document.querySelectorAll('div, span, button, a');
-        for (const text of textSearches) {
-            const element = Array.from(allElements).find(el => 
-                el.textContent.toLowerCase().includes(text.toLowerCase()) && 
-                this.isElementVisible(el)
-            );
-            
-            if (element) {
-                let clickableElement = element;
-                if (!this.isElementClickable(element)) {
-                    clickableElement = element.closest('div[role="link"]') || 
-                                     element.closest('div[tabindex="0"]') || 
-                                     element.parentElement;
-                }
-                
-                if (clickableElement && this.isElementVisible(clickableElement)) {
-                    this.log(`✅ Found submit another button via text: "${text}"`);
-                    return await this.performSubmitAnotherClick(clickableElement);
-                }
-            }
-        }
+        // Debug: Log page structure to understand what's available
+        this.log('🔍 Submit another response button not found, analyzing page structure...');
+        this.logSubmitAnotherDebugInfo();
         
         this.log('❌ Submit another response button not found', 'warning');
         return false;
+    }
+
+    logSubmitAnotherDebugInfo() {
+        this.log('🔍 === SUBMIT ANOTHER DEBUG INFO ===');
+        
+        // Log all divs with role="link"
+        const linkDivs = document.querySelectorAll('div[role="link"]');
+        this.log(`📋 Found ${linkDivs.length} divs with role="link"`);
+        
+        linkDivs.forEach((div, index) => {
+            const hasTabindex = div.hasAttribute('tabindex');
+            const tabindexValue = div.getAttribute('tabindex');
+            const className = div.className;
+            const textContent = div.textContent?.trim().substring(0, 50);
+            const hasSubmitSpan = div.querySelector('span[data-automation-id="submitAnother"]');
+            
+            this.log(`  [${index}] Class: "${className}", tabindex: "${tabindexValue}", hasSubmitSpan: ${!!hasSubmitSpan}`);
+            this.log(`       Text: "${textContent}"`);
+        });
+        
+        // Log all spans with data-automation-id
+        const automationSpans = document.querySelectorAll('span[data-automation-id]');
+        this.log(`📋 Found ${automationSpans.length} spans with data-automation-id`);
+        
+        automationSpans.forEach((span, index) => {
+            const automationId = span.getAttribute('data-automation-id');
+            const textContent = span.textContent?.trim();
+            const parentInfo = `${span.parentElement?.tagName}.${span.parentElement?.className}`;
+            
+            this.log(`  [${index}] automation-id: "${automationId}", text: "${textContent}", parent: ${parentInfo}`);
+        });
+        
+        // Log all elements containing "submit" or "response" text
+        const allElements = document.querySelectorAll('*');
+        const submitElements = Array.from(allElements).filter(el => {
+            const text = el.textContent?.toLowerCase() || '';
+            return text.includes('submit') && text.includes('response') && text.length < 100;
+        });
+        
+        this.log(`📋 Found ${submitElements.length} elements containing "submit" and "response"`);
+        submitElements.forEach((el, index) => {
+            this.log(`  [${index}] ${el.tagName}.${el.className}: "${el.textContent?.trim()}"`);
+        });
+        
+        this.log('🔍 === END DEBUG INFO ===');
     }
 
     // Multi-page form navigation functions
@@ -3214,92 +3377,163 @@ class QuickFillFormsV2 {
             id: element.id,
             role: element.getAttribute('role'),
             tabindex: element.getAttribute('tabindex'),
-            text: element.textContent?.trim()
+            text: element.textContent?.trim(),
+            href: element.getAttribute('href'),
+            onClick: element.getAttribute('onclick')
         };
         
         this.log(`📋 Element info: ${JSON.stringify(elementInfo)}`);
         
-        // Scroll element into view
+        // Ensure element is ready for interaction
         element.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await this.sleep(500);
+        await this.sleep(800);
         
-        // Method 1: Direct click
+        // Check if element is still visible and clickable
+        if (!this.isElementVisible(element)) {
+            this.log('❌ Element became invisible after scroll');
+            return false;
+        }
+        
+        // Method 1: Focus and click
         try {
-            this.log('🔄 Method 1: Direct click');
+            this.log('🔄 Method 1: Focus and click');
+            
+            // Focus the element first
+            if (element.focus) {
+                element.focus();
+                await this.sleep(200);
+            }
+            
             element.click();
-            await this.sleep(1500);
+            await this.sleep(2000); // Longer wait for navigation
             
             // Check if we're back to the form (indicating success)
             if (this.isBackToForm()) {
-                this.log('✅ Submit another successful - back to form');
+                this.log('✅ Submit another successful - back to form (Method 1)');
                 return true;
             }
         } catch (error) {
             this.log(`⚠️ Method 1 failed: ${error.message}`);
         }
         
-        // Method 2: Mouse event
+        // Method 2: Comprehensive click simulation
         try {
-            this.log('🔄 Method 2: Mouse event');
+            this.log('🔄 Method 2: Comprehensive click simulation');
             const rect = element.getBoundingClientRect();
-            const clickEvent = new MouseEvent('click', {
-                view: window,
-                bubbles: true,
-                cancelable: true,
-                clientX: rect.left + rect.width / 2,
-                clientY: rect.top + rect.height / 2
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            
+            // Simulate full click sequence
+            const mouseDownEvent = new MouseEvent('mousedown', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
             });
+            const mouseUpEvent = new MouseEvent('mouseup', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
+            });
+            const clickEvent = new MouseEvent('click', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
+            });
+            
+            element.dispatchEvent(mouseDownEvent);
+            await this.sleep(50);
+            element.dispatchEvent(mouseUpEvent);
+            await this.sleep(50);
             element.dispatchEvent(clickEvent);
-            await this.sleep(1500);
+            await this.sleep(2000);
             
             if (this.isBackToForm()) {
-                this.log('✅ Submit another successful via mouse event');
+                this.log('✅ Submit another successful via comprehensive click (Method 2)');
                 return true;
             }
         } catch (error) {
             this.log(`⚠️ Method 2 failed: ${error.message}`);
         }
         
-        // Method 3: Keyboard activation
+        // Method 3: Enhanced keyboard activation
         try {
-            this.log('🔄 Method 3: Keyboard activation');
+            this.log('🔄 Method 3: Enhanced keyboard activation');
             element.focus();
-            await this.sleep(200);
+            await this.sleep(300);
             
+            // Try Enter key
             const enterEvent = new KeyboardEvent('keydown', {
-                key: 'Enter',
-                code: 'Enter',
-                keyCode: 13,
-                bubbles: true,
-                cancelable: true
+                key: 'Enter', code: 'Enter', keyCode: 13,
+                bubbles: true, cancelable: true
             });
             element.dispatchEvent(enterEvent);
-            await this.sleep(1500);
+            await this.sleep(500);
+            
+            // Also try Space key (for some elements)
+            const spaceEvent = new KeyboardEvent('keydown', {
+                key: ' ', code: 'Space', keyCode: 32,
+                bubbles: true, cancelable: true
+            });
+            element.dispatchEvent(spaceEvent);
+            await this.sleep(2000);
             
             if (this.isBackToForm()) {
-                this.log('✅ Submit another successful via keyboard');
+                this.log('✅ Submit another successful via enhanced keyboard (Method 3)');
                 return true;
             }
         } catch (error) {
             this.log(`⚠️ Method 3 failed: ${error.message}`);
         }
         
-        // Method 4: Try clicking child span if exists
+        // Method 4: Try clicking child elements
         try {
-            this.log('🔄 Method 4: Looking for child span element');
+            this.log('🔄 Method 4: Looking for clickable child elements');
+            
+            // Try child span with data-automation-id
             const childSpan = element.querySelector('span[data-automation-id="submitAnother"]');
             if (childSpan) {
                 this.log('🎯 Found child span element, clicking it');
                 childSpan.click();
-                await this.sleep(1500);
+                await this.sleep(2000);
                 
                 if (this.isBackToForm()) {
-                    this.log('✅ Submit another successful via child span');
+                    this.log('✅ Submit another successful via child span (Method 4)');
                     return true;
+                }
+            }
+            
+            // Try any clickable child element
+            const clickableChildren = element.querySelectorAll('span, div, a');
+            for (const child of clickableChildren) {
+                if (child.textContent?.toLowerCase().includes('submit') || 
+                    child.textContent?.toLowerCase().includes('gửi')) {
+                    this.log(`🎯 Trying clickable child: ${child.tagName}`);
+                    child.click();
+                    await this.sleep(2000);
+                    
+                    if (this.isBackToForm()) {
+                        this.log('✅ Submit another successful via clickable child (Method 4)');
+                        return true;
+                    }
                 }
             }
         } catch (error) {
             this.log(`⚠️ Method 4 failed: ${error.message}`);
+        }
+        
+        // Method 5: Try URL navigation if href exists
+        try {
+            this.log('🔄 Method 5: URL navigation');
+            const href = element.getAttribute('href');
+            if (href && href !== '#') {
+                this.log(`🎯 Found href: ${href}, navigating...`);
+                window.location.href = href;
+                await this.sleep(3000);
+                
+                if (this.isBackToForm()) {
+                    this.log('✅ Submit another successful via URL navigation (Method 5)');
+                    return true;
+                }
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 5 failed: ${error.message}`);
         }
         
         this.log('❌ All submit another click methods failed');
@@ -3307,22 +3541,38 @@ class QuickFillFormsV2 {
     }
     
     isBackToForm() {
+        this.log('🔍 Checking if back to form...');
+        
         // Check if we're back to the form by looking for form elements
         const formIndicators = [
             '[data-automation-id="questionItem"]',
+            '[data-automation-id="questionContainer"]',
             'input[type="radio"]',
             'input[type="checkbox"]',
             'input[type="text"]',
             'textarea',
             'select',
             '.office-form-question',
-            '[role="radiogroup"]'
+            '[role="radiogroup"]',
+            '[data-automation-id="nextButton"]',
+            '[data-automation-id="submitButton"]'
         ];
         
+        let foundIndicators = 0;
         for (const selector of formIndicators) {
-            if (document.querySelector(selector)) {
-                return true;
+            const elements = document.querySelectorAll(selector);
+            if (elements.length > 0) {
+                foundIndicators++;
+                this.log(`✅ Found form indicator: ${selector} (${elements.length} elements)`);
             }
+        }
+        
+        this.log(`📊 Found ${foundIndicators} form indicators out of ${formIndicators.length}`);
+        
+        // Need at least 2 indicators to be confident we're back to form
+        if (foundIndicators >= 2) {
+            this.log('✅ Confirmed: Back to form page');
+            return true;
         }
         
         // Also check if we're no longer on a "thank you" or completion page
@@ -3331,15 +3581,23 @@ class QuickFillFormsV2 {
             'Thank you',
             'Cảm ơn bạn',
             'Đã ghi lại phản hồi',
-            'response has been submitted'
+            'response has been submitted',
+            'submitAnother' // If we still see submit another, we're not back to form yet
         ];
         
         const pageText = document.body.textContent?.toLowerCase() || '';
-        const hasCompletionText = completionIndicators.some(text => 
-            pageText.includes(text.toLowerCase())
-        );
+        const hasCompletionText = completionIndicators.some(text => {
+            const found = pageText.includes(text.toLowerCase());
+            if (found) {
+                this.log(`⚠️ Still on completion page - found text: "${text}"`);
+            }
+            return found;
+        });
         
-        return !hasCompletionText;
+        const isBackToForm = !hasCompletionText && foundIndicators >= 2;
+        this.log(`📋 Final determination: ${isBackToForm ? 'Back to form' : 'Still on completion page'}`);
+        
+        return isBackToForm;
     }
 
     logPageStructure() {
@@ -3733,6 +3991,14 @@ class QuickFillFormsV2 {
         
         this.log(`⚠️ Questions may still be loading after ${timeout}ms`);
         return false;
+    }
+
+    // Helper method to ensure input is an Array
+    ensureArray(input) {
+        if (!input) return [];
+        if (Array.isArray(input)) return input;
+        if (input.length !== undefined) return Array.from(input); // NodeList, HTMLCollection, etc.
+        return [input]; // Single element
     }
 
     // Advanced element comparison to avoid duplicates

@@ -15,6 +15,25 @@
 
         <div id="status" class="status" style="display: none;"></div>
 
+        <!-- Statistics Section -->
+        <div id="statistics" class="statistics" style="display: none;">
+            <div class="stats-header">📊 Thống kê Session</div>
+            <div class="stats-content">
+                <div class="stat-item">
+                    <span class="stat-label">Forms đã gửi:</span>
+                    <span id="submitCount" class="stat-value">0</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Thời gian chạy:</span>
+                    <span id="sessionDuration" class="stat-value">00:00</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Trạng thái:</span>
+                    <span id="runningStatus" class="stat-value status-idle">Đang chờ</span>
+                </div>
+            </div>
+        </div>
+
         <div class="tabs">
             <div class="tab active" onclick="switchTab('basic')">Cơ bản</div>
             <div class="tab" onclick="switchTab('advanced')">Nâng cao</div>
