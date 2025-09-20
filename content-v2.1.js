@@ -171,10 +171,33 @@ class QuickFillFormsV2 {
             }
             
             this.log(`✅ Completed ${cycleCount} form filling cycles`);
+            
+            // Send completion status to popup
+            chrome.runtime.sendMessage({
+                type: 'status_update',
+                data: {
+                    type: 'success',
+                    message: `✅ Hoàn thành! Đã điền ${cycleCount} form thành công`,
+                    isCompleted: true,
+                    cycleCount: cycleCount
+                }
+            }).catch(err => console.log('Popup closed'));
+            
             return { success: true, message: `Completed ${cycleCount} cycles successfully` };
             
         } catch (error) {
             this.log(`❌ Form filling error: ${error.message}`, 'error');
+            
+            // Send error status to popup
+            chrome.runtime.sendMessage({
+                type: 'status_update',
+                data: {
+                    type: 'error',
+                    message: `❌ Lỗi: ${error.message}`,
+                    isCompleted: true
+                }
+            }).catch(err => console.log('Popup closed'));
+            
             return { success: false, message: error.message };
         } finally {
             this.isRunning = false;
@@ -2271,20 +2294,35 @@ class QuickFillFormsV2 {
             return validCandidates[0];
         }
         
-        // Parse user-defined weights from config (e.g., "50,40,7,2,1" for 5,4,3,2,1)
-        const userWeightsStr = this.currentFormData.likertWeights || '50,40,7,2,1';
-        const userWeights = userWeightsStr.split(',').map(w => parseFloat(w.trim()) || 1);
+        // Parse user-defined weights from config (JSON format for dynamic ranges)
+        let userWeights = {};
+        try {
+            const userWeightsStr = this.currentFormData.likertWeights || '{"5":50,"4":40,"3":7,"2":2,"1":1}';
+            
+            // Handle both old format (CSV) and new format (JSON)
+            if (userWeightsStr.includes(',')) {
+                // Legacy CSV format "50,40,7,2,1" - assume 5,4,3,2,1 order
+                const weights = userWeightsStr.split(',').map(w => parseFloat(w.trim()) || 1);
+                weights.forEach((weight, index) => {
+                    userWeights[5 - index] = weight; // Map to 5,4,3,2,1
+                });
+            } else {
+                // New JSON format {"5":50, "4":40, "3":7, ...}
+                userWeights = JSON.parse(userWeightsStr);
+            }
+        } catch (e) {
+            this.log(`⚠️ Error parsing weights, using defaults: ${e.message}`);
+            userWeights = {5: 50, 4: 40, 3: 7, 2: 2, 1: 1};
+        }
         
-        this.log(`📊 User-defined Likert weights: ${userWeightsStr} -> [${userWeights.join(', ')}]`);
+        this.log(`📊 User-defined Likert weights: ${JSON.stringify(userWeights)}`);
         
         const weights = validCandidates.map((candidate, index) => {
             const value = candidate.bestValue.value;
             const confidence = candidate.bestValue.confidence;
             
-            // Get user-defined weight for this rating value (assuming 5-point scale by default)
-            // Convert rating value (1-5) to weight array index (4-0)
-            const weightIndex = Math.max(0, Math.min(userWeights.length - 1, 5 - value));
-            const userWeight = userWeights[weightIndex] || 1;
+            // Get user-defined weight for this exact rating value
+            const userWeight = userWeights[value] || userWeights[value.toString()] || 1;
             
             // Base weight from user configuration
             let weight = userWeight;
@@ -2298,7 +2336,7 @@ class QuickFillFormsV2 {
             }
             
             this.log(`📊 Weight calculation for value ${value}:`);
-            this.log(`   - User weight (index ${weightIndex}): ${userWeight}`);
+            this.log(`   - User weight for rating ${value}: ${userWeight}`);
             this.log(`   - Confidence modifier: ${confidence}`);
             this.log(`   - Range bonus: ${value >= settingsMin && value <= settingsMax ? '1.1x' : '1.0x'}`);
             this.log(`   - Final weight: ${weight.toFixed(3)}`);

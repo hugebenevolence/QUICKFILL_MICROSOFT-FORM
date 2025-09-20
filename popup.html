@@ -62,11 +62,21 @@
                     </div>
                     
                     <div class="form-group weight-config">
-                        <label>⚖️ Trọng số phân phối điểm (5,4,3,2,1):</label>
-                        <input type="text" id="likertWeights" value="50,40,7,2,1" placeholder="50,40,7,2,1" class="weight-input">
-                        <div class="weight-explanation">
-                            <small>💡 <strong>Trọng số tương ứng:</strong> Điểm 5 (50%), Điểm 4 (40%), Điểm 3 (7%), Điểm 2 (2%), Điểm 1 (1%)</small>
-                            <small>📊 Số càng lớn = xuất hiện càng nhiều. Tổng không cần bằng 100.</small>
+                        <label>⚖️ Trọng số phân phối điểm:</label>
+                        <div class="weight-dropdown-container">
+                            <button type="button" id="weightToggle" class="weight-toggle-btn">
+                                <span id="weightSummary">Cấu hình trọng số (4-5)</span>
+                                <span class="dropdown-arrow">▼</span>
+                            </button>
+                            <div id="weightDropdown" class="weight-dropdown hidden">
+                                <div class="weight-inputs-container" id="weightInputsContainer">
+                                    <!-- Dynamic weight inputs will be generated here -->
+                                </div>
+                                <div class="weight-explanation">
+                                    <small>� Số càng lớn = xuất hiện càng nhiều. Tổng không cần bằng 100.</small>
+                                    <small>📊 Ví dụ: 70,25,5 = điểm cao 70%, điểm trung 25%, điểm thấp 5%</small>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     

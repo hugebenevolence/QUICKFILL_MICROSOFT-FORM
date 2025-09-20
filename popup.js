@@ -65,6 +65,17 @@ class PopupController {
             });
         }
 
+        // Weight dropdown toggle
+        const weightToggle = document.getElementById('weightToggle');
+        const weightDropdown = document.getElementById('weightDropdown');
+        
+        if (weightToggle && weightDropdown) {
+            weightToggle.addEventListener('click', () => {
+                weightDropdown.classList.toggle('hidden');
+                weightToggle.classList.toggle('active');
+            });
+        }
+
         // Rating range preview and validation
         const ratingMin = document.getElementById('ratingMin');
         const ratingMax = document.getElementById('ratingMax');
@@ -78,6 +89,9 @@ class PopupController {
             if (min > max) {
                 ratingMax.value = min;
             }
+            
+            // Update weight inputs based on range
+            this.updateWeightInputs(min, max);
             if (min < 1) {
                 ratingMin.value = 1;
             }
@@ -125,7 +139,12 @@ class PopupController {
             // Basic settings
             this.setInputValue('ratingMin', result.ratingMin || 4);
             this.setInputValue('ratingMax', result.ratingMax || 5);
-            this.setInputValue('likertWeights', result.likertWeights || '50,40,7,2,1');
+            
+            // Store weights for dropdown (backward compatibility)
+            if (result.likertWeights && typeof result.likertWeights === 'string') {
+                localStorage.setItem('likertWeights', result.likertWeights);
+            }
+            
             this.setInputValue('preferPositiveAnswers', result.preferPositiveAnswers !== false);
             this.setInputValue('avoidOther', result.avoidOther !== false);
             this.setInputValue('autoSubmitAnother', result.autoSubmitAnother !== false);
@@ -148,6 +167,11 @@ class PopupController {
             const radioStrategy = result.radioStrategy || 'random';
             const radioElement = document.querySelector(`input[name="radioStrategy"][value="${radioStrategy}"]`);
             if (radioElement) radioElement.checked = true;
+
+            // Initialize weight inputs after loading settings
+            const min = parseInt(result.ratingMin || 4);
+            const max = parseInt(result.ratingMax || 5);
+            this.updateWeightInputs(min, max);
 
         } catch (error) {
             console.error('Error loading settings:', error);
@@ -172,7 +196,7 @@ class PopupController {
                 // Basic settings
                 ratingMin: parseInt(document.getElementById('ratingMin').value) || 4,
                 ratingMax: parseInt(document.getElementById('ratingMax').value) || 5,
-                likertWeights: document.getElementById('likertWeights').value || '50,40,7,2,1',
+                likertWeights: localStorage.getItem('likertWeights') || JSON.stringify({5: 50, 4: 40, 3: 7, 2: 2, 1: 1}),
                 preferPositiveAnswers: document.getElementById('preferPositiveAnswers').checked,
                 avoidOther: document.getElementById('avoidOther').checked,
                 autoSubmitAnother: document.getElementById('autoSubmitAnother').checked,
@@ -591,6 +615,27 @@ class PopupController {
                     // Extension started, begin session
                     this.startSession();
                 }
+            } else if (message.type === 'status_update') {
+                console.log('📋 Received completion status:', message.data);
+                
+                // Update status display
+                this.showStatus(message.data.message, message.data.type);
+                
+                // Update running status if completed
+                if (message.data.isCompleted) {
+                    this.currentStats.isRunning = false;
+                    this.stopSession();
+                    
+                    // Update running status display to completed
+                    const statusElement = document.getElementById('runningStatus');
+                    if (statusElement) {
+                        statusElement.textContent = message.data.type === 'success' ? 'Hoàn thành' : 'Lỗi';
+                        statusElement.className = `stat-value ${message.data.type === 'success' ? 'status-completed' : 'status-error'}`;
+                    }
+                    
+                    // Show/hide appropriate buttons
+                    this.updateUI();
+                }
             }
         });
     }
@@ -799,6 +844,130 @@ class PopupController {
         }, 10000);
         
         console.log('⏹️ Session stopped - statistics preserved');
+    }
+
+    // Weight dropdown management
+    updateWeightInputs(min, max) {
+        const container = document.getElementById('weightInputsContainer');
+        const summary = document.getElementById('weightSummary');
+        
+        if (!container || !summary) return;
+        
+        // Update summary text
+        summary.textContent = `Cấu hình trọng số (${min}-${max})`;
+        
+        // Clear existing inputs
+        container.innerHTML = '';
+        
+        // Load current weights or create defaults
+        const currentWeights = this.getCurrentWeights(min, max);
+        
+        // Create input for each rating value in range
+        for (let rating = max; rating >= min; rating--) {
+            const row = this.createWeightInputRow(rating, currentWeights[rating] || 1);
+            container.appendChild(row);
+        }
+        
+        // Update percentages
+        this.updateWeightPercentages();
+    }
+
+    getCurrentWeights(min, max) {
+        const weights = {};
+        const stored = this.getStoredWeights();
+        
+        // Initialize with defaults (higher ratings get higher weights)
+        for (let rating = min; rating <= max; rating++) {
+            const defaultWeight = Math.max(1, (rating - min + 1) * 10);
+            weights[rating] = stored[rating] || defaultWeight;
+        }
+        
+        return weights;
+    }
+
+    getStoredWeights() {
+        try {
+            const weightsStr = localStorage.getItem('likertWeights') || '';
+            if (!weightsStr) return {};
+            
+            // Parse stored format like "50,40,7,2,1" or JSON
+            if (weightsStr.includes(',')) {
+                // Legacy format - assume 5,4,3,2,1 order
+                const values = weightsStr.split(',').map(v => parseFloat(v.trim()) || 1);
+                const weights = {};
+                values.forEach((weight, index) => {
+                    weights[5 - index] = weight; // Map to 5,4,3,2,1
+                });
+                return weights;
+            } else {
+                return JSON.parse(weightsStr);
+            }
+        } catch (e) {
+            return {};
+        }
+    }
+
+    createWeightInputRow(rating, weight) {
+        const row = document.createElement('div');
+        row.className = 'weight-input-row';
+        
+        const stars = '★'.repeat(rating);
+        
+        row.innerHTML = `
+            <div class="weight-label">
+                <span class="weight-star">${stars}</span>
+                <span>Điểm ${rating}:</span>
+            </div>
+            <input type="number" class="weight-input" min="0" step="0.1" value="${weight}" 
+                   data-rating="${rating}" onchange="window.popupController.onWeightChange()">
+            <div class="weight-percentage" data-rating="${rating}">0%</div>
+        `;
+        
+        return row;
+    }
+
+    onWeightChange() {
+        this.updateWeightPercentages();
+        this.saveWeights();
+    }
+
+    updateWeightPercentages() {
+        const inputs = document.querySelectorAll('.weight-input');
+        const percentages = document.querySelectorAll('.weight-percentage');
+        
+        let total = 0;
+        const weights = {};
+        
+        // Calculate total weight
+        inputs.forEach(input => {
+            const rating = input.dataset.rating;
+            const weight = parseFloat(input.value) || 0;
+            weights[rating] = weight;
+            total += weight;
+        });
+        
+        // Update percentage displays
+        percentages.forEach(percentage => {
+            const rating = percentage.dataset.rating;
+            const weight = weights[rating] || 0;
+            const percent = total > 0 ? ((weight / total) * 100).toFixed(1) : 0;
+            percentage.textContent = `${percent}%`;
+        });
+    }
+
+    saveWeights() {
+        const inputs = document.querySelectorAll('.weight-input');
+        const weights = {};
+        
+        inputs.forEach(input => {
+            const rating = parseInt(input.dataset.rating);
+            const weight = parseFloat(input.value) || 1;
+            weights[rating] = weight;
+        });
+        
+        // Save as JSON for dynamic ranges
+        localStorage.setItem('likertWeights', JSON.stringify(weights));
+        this.saveSettings(); // Trigger main settings save
     }
 }
 
