@@ -593,6 +593,9 @@ class PopupController {
             sessionDuration: 0,
             isRunning: false
         });
+        
+        // Start real-time updates
+        this.startRealTimeUpdates();
     }
 
     updateStatistics(data) {
