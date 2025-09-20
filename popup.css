@@ -12,6 +12,41 @@ body {
     min-height: 600px;
 }
 
+/* Trọng số Likert styling */
+.weight-config {
+    background: #f8f9fb;
+    padding: 12px;
+    border-radius: 6px;
+    border-left: 4px solid #3b82f6;
+}
+
+.weight-input {
+    font-family: 'Courier New', monospace;
+    font-weight: bold;
+    color: #1e40af;
+    background: white;
+    border: 2px solid #e5e7eb;
+    border-radius: 4px;
+    padding: 8px 12px;
+}
+
+.weight-input:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.weight-explanation {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.weight-explanation small {
+    color: #6b7280;
+    line-height: 1.4;
+}
+
 .container {
     max-width: 100%;
     padding: 20px;

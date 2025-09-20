@@ -116,7 +116,7 @@ class PopupController {
     async loadSettings() {
         try {
             const result = await chrome.storage.sync.get([
-                'ratingMin', 'ratingMax', 'preferPositiveAnswers', 'avoidOther', 
+                'ratingMin', 'ratingMax', 'likertWeights', 'preferPositiveAnswers', 'avoidOther', 
                 'autoSubmitAnother', 'textLanguage', 'maxFormSubmissions', 'submitDelay',
                 'geminiApiKey', 'useRandomDelay', 'delayMin', 'delayMax', 
                 'maxRetries', 'questionTimeout', 'specialQuestions', 'radioStrategy'
@@ -125,6 +125,7 @@ class PopupController {
             // Basic settings
             this.setInputValue('ratingMin', result.ratingMin || 4);
             this.setInputValue('ratingMax', result.ratingMax || 5);
+            this.setInputValue('likertWeights', result.likertWeights || '50,40,7,2,1');
             this.setInputValue('preferPositiveAnswers', result.preferPositiveAnswers !== false);
             this.setInputValue('avoidOther', result.avoidOther !== false);
             this.setInputValue('autoSubmitAnother', result.autoSubmitAnother !== false);
@@ -171,6 +172,7 @@ class PopupController {
                 // Basic settings
                 ratingMin: parseInt(document.getElementById('ratingMin').value) || 4,
                 ratingMax: parseInt(document.getElementById('ratingMax').value) || 5,
+                likertWeights: document.getElementById('likertWeights').value || '50,40,7,2,1',
                 preferPositiveAnswers: document.getElementById('preferPositiveAnswers').checked,
                 avoidOther: document.getElementById('avoidOther').checked,
                 autoSubmitAnother: document.getElementById('autoSubmitAnother').checked,

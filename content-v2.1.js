@@ -137,13 +137,12 @@ class QuickFillFormsV2 {
             let cycleCount = 0;
             // Handle different property names from popup settings
             const maxCycles = this.currentFormData.repeatCount || 
-                            this.currentFormData.maxFormSubmissions || 
-                            1;
+                            this.currentFormData.maxFormSubmissions;
             
             this.log(`🎯 Max cycles configured: ${maxCycles} (repeatCount=${this.currentFormData.repeatCount}, maxFormSubmissions=${this.currentFormData.maxFormSubmissions})`);
             
-            // If maxFormSubmissions is 0, it means unlimited, so set a reasonable limit
-            const effectiveMaxCycles = (maxCycles === 0) ? 100 : maxCycles;
+            // If maxFormSubmissions is 0 or undefined, it means unlimited, so set a reasonable limit
+            const effectiveMaxCycles = (maxCycles === 0 || maxCycles === undefined) ? Number.MAX_SAFE_INTEGER : maxCycles;
             
             while (cycleCount < effectiveMaxCycles && this.isRunning) {
                 this.log(`🔄 Starting fill cycle ${cycleCount + 1}/${effectiveMaxCycles}`);
@@ -2272,42 +2271,36 @@ class QuickFillFormsV2 {
             return validCandidates[0];
         }
         
-        // Calculate sophisticated weights based on user preferences
-        const userRange = settingsMax - settingsMin + 1;
-        const userMidpoint = (settingsMin + settingsMax) / 2;
+        // Parse user-defined weights from config (e.g., "50,40,7,2,1" for 5,4,3,2,1)
+        const userWeightsStr = this.currentFormData.likertWeights || '50,40,7,2,1';
+        const userWeights = userWeightsStr.split(',').map(w => parseFloat(w.trim()) || 1);
         
-        this.log(`📊 User preference analysis: range=${userRange}, midpoint=${userMidpoint}`);
+        this.log(`📊 User-defined Likert weights: ${userWeightsStr} -> [${userWeights.join(', ')}]`);
         
         const weights = validCandidates.map((candidate, index) => {
             const value = candidate.bestValue.value;
             const confidence = candidate.bestValue.confidence;
             
-            // Base weight from position in valid candidates (higher = more weight)
-            let weight = Math.pow(2, index + 1);
+            // Get user-defined weight for this rating value (assuming 5-point scale by default)
+            // Convert rating value (1-5) to weight array index (4-0)
+            const weightIndex = Math.max(0, Math.min(userWeights.length - 1, 5 - value));
+            const userWeight = userWeights[weightIndex] || 1;
             
-            // Confidence bonus
-            weight *= confidence;
+            // Base weight from user configuration
+            let weight = userWeight;
             
-            // Distance from user's max preference (closer to max = higher weight)
-            const distanceFromMax = Math.abs(value - settingsMax);
-            const maxDistance = settingsMax - settingsMin;
+            // Confidence bonus (small modifier to maintain user's preference)
+            weight *= (0.8 + confidence * 0.2);
             
-            if (distanceFromMax === 0) {
-                weight *= 3.0; // 3x bonus for exact max match
-            } else if (distanceFromMax <= 1) {
-                weight *= 2.0; // 2x bonus for close to max
-            } else if (value >= userMidpoint) {
-                weight *= 1.5; // 1.5x bonus for above midpoint
+            // Small bonus for values in user's preferred range
+            if (value >= settingsMin && value <= settingsMax) {
+                weight *= 1.1; // 10% bonus for being in range
             }
             
-            // Small bonus for higher values in general
-            const normalizedValue = (value - settingsMin) / (settingsMax - settingsMin);
-            weight *= (1 + normalizedValue * 0.5);
-            
             this.log(`📊 Weight calculation for value ${value}:`);
-            this.log(`   - Base weight: ${Math.pow(2, index + 1)}`);
-            this.log(`   - Confidence: ${confidence}`);
-            this.log(`   - Distance from max (${settingsMax}): ${distanceFromMax}`);
+            this.log(`   - User weight (index ${weightIndex}): ${userWeight}`);
+            this.log(`   - Confidence modifier: ${confidence}`);
+            this.log(`   - Range bonus: ${value >= settingsMin && value <= settingsMax ? '1.1x' : '1.0x'}`);
             this.log(`   - Final weight: ${weight.toFixed(3)}`);
             
             return weight;
