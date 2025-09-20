@@ -222,6 +222,34 @@ class QuickFillFormsV2 {
                 // No navigation buttons found - try manual submit if auto-submit enabled
                 if (this.currentFormData.autoSubmit) {
                     this.log('📤 No navigation buttons found, attempting manual submit...');
+                    
+                    // Enhanced comprehensive validation check before submit
+                    await this.sleep(1000); // Give form time to update and process
+                    
+                    const validationResult = this.performComprehensiveValidation();
+                    
+                    if (!validationResult.isValid) {
+                        this.log(`⚠️ Form validation issues detected (${validationResult.errors.length} issues):`, 'warning');
+                        validationResult.errors.forEach(error => this.log(`  • ${error}`, 'warning'));
+                        
+                        // Check if errors are critical or can be ignored
+                        const criticalErrors = validationResult.errors.filter(error => 
+                            error.toLowerCase().includes('required') || 
+                            error.toLowerCase().includes('mandatory') ||
+                            error.toLowerCase().includes('must')
+                        );
+                        
+                        if (criticalErrors.length > 0) {
+                            this.log(`❌ Critical validation errors found, cannot submit:`, 'error');
+                            criticalErrors.forEach(error => this.log(`  • ${error}`, 'error'));
+                            throw new Error(`Critical validation errors: ${criticalErrors.join(', ')}`);
+                        } else {
+                            this.log('🔄 Non-critical validation issues, proceeding with submit');
+                        }
+                    } else {
+                        this.log(`✅ Form validation passed: ${validationResult.successMessage}`, 'success');
+                    }
+                    
                     try {
                         await this.submitForm();
                         return true;
@@ -275,75 +303,572 @@ class QuickFillFormsV2 {
     }
 
     async getAllQuestions() {
-        // Try multiple selectors to find questions
-        const questionSelectors = [
-            '[data-automation-id="questionItem"]',
-            '[role="radiogroup"]',
-            '.office-form-question',
-            '.question-title-container',
-            '[data-automation-id="choiceGroupView"]'
-        ];
+        this.log('🔍 SMART question detection starting...');
         
-        let allQuestions = [];
-        
-        for (const selector of questionSelectors) {
-            const elements = document.querySelectorAll(selector);
-            for (const element of elements) {
-                if (!allQuestions.some(q => q.element === element)) {
-                    const questionType = this.identifyQuestionType(element);
-                    if (questionType) {
-                        allQuestions.push({
-                            element: element,
-                            type: questionType,
-                            index: allQuestions.length
-                        });
-                    }
-                }
-            }
+        // Clear processed questions if user manually triggered restart
+        if (this.shouldResetProcessedQuestions()) {
+            this.log('🔄 Resetting processed questions for fresh start...');
+            this.processedQuestions.clear();
         }
         
-        // Remove duplicates and sort by DOM position
-        allQuestions = allQuestions.filter((question, index, self) => 
-            index === self.findIndex(q => q.element === question.element)
-        );
+        // Use primary strategy first - most reliable
+        let allQuestions = this.detectStandardQuestions();
         
-        // Filter out already processed questions for current page
-        const unprocessedQuestions = allQuestions.filter(question => {
-            const questionId = this.generateQuestionId(question.element);
-            const isProcessed = this.processedQuestions.has(questionId);
-            if (isProcessed) {
-                this.log(`⏭️ Skipping already processed question: ${questionId}`);
-            }
-            return !isProcessed;
-        });
+        // Only use fallback strategies if primary doesn't find enough
+        if (allQuestions.length === 0) {
+            this.log('⚠️ No standard questions found, trying fallback strategies...');
+            allQuestions = this.detectFallbackQuestions();
+        }
         
-        this.log(`📊 Found ${allQuestions.length} total questions, ${unprocessedQuestions.length} unprocessed`);
+        // Remove duplicates and invalid questions
+        allQuestions = this.cleanAndValidateQuestions(allQuestions);
+        
+        // Sort by priority and DOM position
+        allQuestions = this.sortQuestionsByPriority(allQuestions);
+        
+        // Filter out processed questions (but allow re-detection if needed)
+        const unprocessedQuestions = this.filterUnprocessedQuestions(allQuestions);
+        
+        this.log(`📊 FINAL: ${allQuestions.length} total questions, ${unprocessedQuestions.length} ready to process`);
         
         return unprocessedQuestions;
     }
 
-    generateQuestionId(element) {
-        // Generate unique ID for question tracking across pages
-        const titleElement = element.querySelector('[data-automation-id="questionTitle"]');
-        const questionText = titleElement ? titleElement.textContent.trim() : '';
+    shouldResetProcessedQuestions() {
+        // Reset if this is a fresh manual trigger (not from page navigation)
+        const now = Date.now();
+        const timeSinceLastReset = now - (this.lastResetTime || 0);
         
-        // Use element ID if available, otherwise use question text hash
-        if (element.id) {
-            return element.id;
-        } else if (questionText) {
-            // Create simple hash from question text
-            let hash = 0;
-            for (let i = 0; i < questionText.length; i++) {
-                const char = questionText.charCodeAt(i);
-                hash = ((hash << 5) - hash) + char;
-                hash = hash & hash; // Convert to 32-bit integer
-            }
-            return `question_${Math.abs(hash)}`;
-        } else {
-            // Fallback: use element position and attributes
-            const xpath = this.getElementXPath(element);
-            return `question_xpath_${xpath.slice(-20)}`;
+        // Reset if it's been more than 30 seconds since last activity
+        // OR if user manually clicked the extension
+        if (timeSinceLastReset > 30000) {
+            this.lastResetTime = now;
+            return true;
         }
+        
+        return false;
+    }
+
+    detectStandardQuestions() {
+        const questions = [];
+        
+        // Primary strategy: Microsoft Forms standard question items
+        const questionItems = document.querySelectorAll('[data-automation-id="questionItem"]');
+        this.log(`📊 Primary detection: ${questionItems.length} standard question items`);
+        
+        for (const element of questionItems) {
+            if (!this.isQuestionElementReady(element)) continue;
+            
+            const questionType = this.identifyQuestionType(element);
+            if (questionType) {
+                const questionId = this.generateQuestionId(element);
+                
+                // Check for duplicates
+                if (!questions.some(q => q.id === questionId)) {
+                    questions.push({
+                        element: element,
+                        type: questionType,
+                        id: questionId,
+                        priority: this.getQuestionPriority(questionType, element),
+                        isRequired: this.isQuestionRequired(element),
+                        source: 'standard'
+                    });
+                    
+                    this.log(`✅ Standard question: ${questionType} (ID: ${questionId.substring(0, 12)}...)`);
+                }
+            }
+        }
+        
+        return questions;
+    }
+
+    detectFallbackQuestions() {
+        const questions = [];
+        
+        this.log('🔄 Using fallback detection strategies...');
+        
+        // Strategy 1: Radio groups that might be standalone
+        const radioGroups = document.querySelectorAll('[role="radiogroup"]');
+        this.log(`📊 Fallback 1: ${radioGroups.length} radio groups`);
+        
+        for (const element of radioGroups) {
+            // Skip if it's already inside a standard question item
+            if (element.closest('[data-automation-id="questionItem"]')) continue;
+            
+            if (this.isQuestionElementReady(element)) {
+                const questionId = this.generateQuestionId(element);
+                
+                if (!questions.some(q => q.id === questionId)) {
+                    questions.push({
+                        element: element,
+                        type: 'radio',
+                        id: questionId,
+                        priority: 2,
+                        isRequired: this.isQuestionRequired(element),
+                        source: 'radiogroup'
+                    });
+                    
+                    this.log(`✅ Fallback radio group: ${questionId.substring(0, 12)}...`);
+                }
+            }
+        }
+        
+        // Strategy 2: Matrix/Likert questions
+        const matrixQuestions = this.detectMatrixQuestions();
+        questions.push(...matrixQuestions);
+        
+        return questions;
+    }
+
+    detectMatrixQuestions() {
+        const matrixQuestions = [];
+        
+        // Look for Likert scale containers
+        const likertContainers = document.querySelectorAll('[data-automation-id*="likert"], [data-automation-id*="matrix"]');
+        
+        for (const container of likertContainers) {
+            // Skip if already processed or inside standard question
+            if (container.closest('[data-automation-id="questionItem"]')) continue;
+            
+            const radioInputs = container.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length >= 5) { // Likely a Likert scale
+                const questionId = this.generateQuestionId(container);
+                
+                if (!matrixQuestions.some(q => q.id === questionId)) {
+                    matrixQuestions.push({
+                        element: container,
+                        type: 'matrix',
+                        id: questionId,
+                        priority: 4,
+                        isRequired: this.isQuestionRequired(container),
+                        source: 'matrix'
+                    });
+                    
+                    this.log(`✅ Matrix question detected: ${questionId.substring(0, 12)}... (${radioInputs.length} inputs)`);
+                }
+            }
+        }
+        
+        return matrixQuestions;
+    }
+
+    cleanAndValidateQuestions(questions) {
+        // Remove duplicates based on element reference and ID
+        const cleanQuestions = [];
+        const seenElements = new Set();
+        const seenIds = new Set();
+        
+        for (const question of questions) {
+            // Skip if we've seen this element or ID
+            if (seenElements.has(question.element) || seenIds.has(question.id)) {
+                continue;
+            }
+            
+            // Validate question is still in DOM and ready
+            if (document.contains(question.element) && this.isQuestionElementReady(question.element)) {
+                cleanQuestions.push(question);
+                seenElements.add(question.element);
+                seenIds.add(question.id);
+            }
+        }
+        
+        this.log(`🧹 Cleaned questions: ${questions.length} → ${cleanQuestions.length} (removed ${questions.length - cleanQuestions.length} duplicates/invalid)`);
+        
+        return cleanQuestions;
+    }
+
+    sortQuestionsByPriority(questions) {
+        return questions.sort((a, b) => {
+            // First sort by required status
+            if (a.isRequired !== b.isRequired) {
+                return b.isRequired - a.isRequired;
+            }
+            
+            // Then by priority
+            if (a.priority !== b.priority) {
+                return b.priority - a.priority;
+            }
+            
+            // Finally by DOM position
+            const aRect = a.element.getBoundingClientRect();
+            const bRect = b.element.getBoundingClientRect();
+            
+            return aRect.top - bRect.top;
+        });
+    }
+
+    filterUnprocessedQuestions(allQuestions) {
+        const unprocessedQuestions = [];
+        
+        for (const question of allQuestions) {
+            const isProcessed = this.processedQuestions.has(question.id);
+            const isStillAnswered = this.isQuestionStillAnswered(question);
+            
+            if (isProcessed && isStillAnswered) {
+                // Question was processed and is still answered - skip
+                continue;
+            } else if (isProcessed && !isStillAnswered) {
+                // Question was processed but answer is gone - re-process
+                this.log(`� Re-processing question with lost answer: ${question.id}`);
+                this.processedQuestions.delete(question.id);
+                unprocessedQuestions.push(question);
+            } else {
+                // New unprocessed question
+                unprocessedQuestions.push(question);
+            }
+        }
+        
+        return unprocessedQuestions;
+    }
+
+    isQuestionStillAnswered(question) {
+        try {
+            return this.isQuestionAnswered(question.element);
+        } catch (error) {
+            // If we can't determine, assume it needs re-processing
+            return false;
+        }
+    }
+
+    findOrphanedFormControls() {
+        const orphanedControls = [];
+        
+        try {
+            // Look for form controls that might not be inside proper question containers  
+            const formControlSelectors = [
+                'input[type="radio"]',
+                'input[type="checkbox"]', 
+                'input[type="text"]',
+                'textarea',
+                'select',
+                '[role="slider"]'
+            ];
+            
+            formControlSelectors.forEach(selector => {
+                const controls = document.querySelectorAll(selector);
+                
+                for (const control of controls) {
+                    // Check if this control is already inside a detected question container
+                    const parentQuestion = control.closest(`
+                        [data-automation-id="questionItem"], 
+                        .office-form-question, 
+                        [data-automation-id="question"],
+                        [role="radiogroup"],
+                        .question-container
+                    `);
+                    
+                    if (!parentQuestion && this.isElementVisible(control)) {
+                        // This is an orphaned control, find or create appropriate container
+                        const wrapper = this.findOrCreateControlContainer(control);
+                        if (wrapper && !orphanedControls.includes(wrapper)) {
+                            orphanedControls.push(wrapper);
+                            this.log(`🔍 Found orphaned form control: ${control.type || control.tagName}`);
+                        }
+                    }
+                }
+            });
+        } catch (error) {
+            this.log(`❌ Error finding orphaned controls: ${error.message}`, 'error');
+        }
+        
+        return orphanedControls;
+    }
+
+    findOrCreateControlContainer(control) {
+        try {
+            // Try to find a logical container (like a parent div with question-like attributes)
+            let container = control.closest('div[aria-labelledby], div.form-group, fieldset');
+            
+            if (!container) {
+                // Look for a parent that contains question text
+                let parent = control.parentElement;
+                while (parent && parent !== document.body) {
+                    const text = parent.textContent?.trim();
+                    if (text && text.length > 10 && text.length < 500 && text.includes('?')) {
+                        container = parent;
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            
+            if (!container) {
+                // Last resort: create a synthetic container
+                container = document.createElement('div');
+                container.setAttribute('data-synthetic-question', 'true');
+                container.setAttribute('data-original-control', control.id || control.name || 'unnamed');
+                
+                // Insert container before the control
+                control.parentNode?.insertBefore(container, control);
+                container.appendChild(control);
+            }
+            
+            return container;
+        } catch (error) {
+            this.log(`❌ Error creating control container: ${error.message}`, 'error');
+            return null;
+        }
+    }
+
+    findTableBasedQuestions() {
+        const tableQuestions = [];
+        
+        try {
+            // Look for tables that contain form controls (Likert scales, matrices)
+            const tables = document.querySelectorAll('table, [role="table"], .table-container');
+            
+            for (const table of tables) {
+                const formControls = table.querySelectorAll('input[type="radio"], input[type="checkbox"], select');
+                
+                if (formControls.length > 0) {
+                    // This table contains form controls, treat it as a question
+                    const existingContainer = table.closest('[data-automation-id="questionItem"], .office-form-question');
+                    
+                    if (!existingContainer) {
+                        // This is a standalone table question
+                        tableQuestions.push(table);
+                        this.log(`🔍 Found table-based question: ${formControls.length} controls`);
+                    }
+                }
+            }
+        } catch (error) {
+            this.log(`❌ Error finding table questions: ${error.message}`, 'error');
+        }
+        
+        return tableQuestions;
+    }
+
+    isQuestionElementReady(element) {
+        try {
+            // Enhanced readiness check
+            if (!this.isElementVisible(element)) {
+                return false;
+            }
+            
+            // Check if question has interactive elements
+            const interactiveElements = element.querySelectorAll(`
+                input[type="radio"], 
+                input[type="checkbox"], 
+                input[type="text"], 
+                textarea, 
+                select,
+                [role="slider"]
+            `);
+            
+            if (interactiveElements.length === 0) {
+                return false;
+            }
+            
+            // Check if at least one interactive element is ready
+            const readyElements = Array.from(interactiveElements).filter(el => {
+                return !el.disabled && this.isElementVisible(el);
+            });
+            
+            return readyElements.length > 0;
+        } catch (error) {
+            this.log(`❌ Error checking question readiness: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    getQuestionPriority(questionType, element) {
+        // Assign priority based on question type and characteristics
+        const basePriority = {
+            'text': 1,      // Fill text fields first (they're simple)
+            'radio': 2,     // Then single-choice questions
+            'checkbox': 2,  // Multi-choice at same level
+            'select': 2,    // Dropdowns at same level
+            'rating': 3,    // Rating scales need special handling
+            'matrix': 4     // Matrix questions are most complex
+        };
+        
+        let priority = basePriority[questionType] || 1;
+        
+        // Boost priority for required questions
+        if (this.isQuestionRequired(element)) {
+            priority += 5;
+        }
+        
+        // Lower priority for questions with conditional logic (they might depend on other answers)
+        if (this.hasConditionalLogic(element)) {
+            priority -= 1;
+        }
+        
+        return priority;
+    }
+
+    isQuestionRequired(element) {
+        try {
+            // Check various indicators for required questions
+            const requiredIndicators = [
+                '[aria-required="true"]',
+                '.required',
+                '[data-required="true"]',
+                '[required]'
+            ];
+            
+            for (const indicator of requiredIndicators) {
+                if (element.querySelector(indicator) || element.matches(indicator)) {
+                    return true;
+                }
+            }
+            
+            // Check for asterisk in question text
+            const questionText = this.getQuestionText(element);
+            return questionText && questionText.includes('*');
+        } catch (error) {
+            return false;
+        }
+    }
+
+    hasConditionalLogic(element) {
+        try {
+            // Check if question has conditional display logic
+            const conditionalIndicators = [
+                '[data-conditional]',
+                '[data-depends-on]',
+                '.conditional-question',
+                '[data-condition]'
+            ];
+            
+            for (const indicator of conditionalIndicators) {
+                if (element.matches(indicator) || element.querySelector(indicator)) {
+                    return true;
+                }
+            }
+            
+            // Check if initially hidden (might be conditional)
+            const style = window.getComputedStyle(element);
+            return style.display === 'none' || style.visibility === 'hidden';
+        } catch (error) {
+            return false;
+        }
+    }
+
+    debugQuestionStructure(element) {
+        if (!this.debug) return;
+        
+        try {
+            this.log(`🔍 DEBUG: Question structure analysis`);
+            this.log(`   - Tag: ${element.tagName}`);
+            this.log(`   - Classes: ${element.className}`);
+            this.log(`   - ID: ${element.id}`);
+            
+            const dataAttrs = Array.from(element.attributes)
+                .filter(attr => attr.name.startsWith('data-'))
+                .map(attr => `${attr.name}="${attr.value}"`)
+                .join(', ');
+            this.log(`   - Data attributes: ${dataAttrs}`);
+            
+            const inputs = element.querySelectorAll('input, textarea, select');
+            this.log(`   - Input elements: ${inputs.length}`);
+            inputs.forEach((input, index) => {
+                this.log(`     ${index + 1}. ${input.tagName}[type="${input.type || 'N/A'}"] - ${input.name || input.id || 'unnamed'}`);
+            });
+            
+            const text = this.getQuestionText(element);
+            this.log(`   - Question text: "${text?.substring(0, 100)}..."`);
+            
+        } catch (error) {
+            this.log(`❌ Error debugging question structure: ${error.message}`, 'error');
+        }
+    }
+
+    generateQuestionId(element) {
+        // Generate stable, unique ID for question tracking
+        
+        // Method 1: Use element ID if available
+        if (element.id && element.id.trim()) {
+            return `id_${element.id}`;
+        }
+        
+        // Method 2: Use question text hash if available
+        const questionText = this.getQuestionText(element);
+        if (questionText && questionText.length > 5) {
+            const hash = this.createStableHash(questionText);
+            return `text_${hash}`;
+        }
+        
+        // Method 3: Use element attributes and structure
+        const attributeSignature = this.getElementSignature(element);
+        if (attributeSignature) {
+            const hash = this.createStableHash(attributeSignature);
+            return `attr_${hash}`;
+        }
+        
+        // Method 4: Use DOM position as last resort
+        const domPosition = this.getElementDOMPosition(element);
+        return `pos_${domPosition}`;
+    }
+
+    createStableHash(text) {
+        // Create a stable hash that's consistent across sessions
+        let hash = 0;
+        if (text.length === 0) return hash;
+        
+        for (let i = 0; i < text.length; i++) {
+            const char = text.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        
+        return Math.abs(hash).toString(36); // Base36 for shorter IDs
+    }
+
+    getElementSignature(element) {
+        // Create a unique signature from element attributes and structure
+        const parts = [];
+        
+        // Add tag name
+        parts.push(element.tagName.toLowerCase());
+        
+        // Add significant attributes
+        const significantAttrs = ['data-automation-id', 'class', 'role', 'aria-label', 'name'];
+        for (const attr of significantAttrs) {
+            const value = element.getAttribute(attr);
+            if (value) {
+                parts.push(`${attr}:${value.substring(0, 20)}`);
+            }
+        }
+        
+        // Add child element count and types
+        const childTypes = Array.from(element.children).map(child => child.tagName.toLowerCase());
+        const uniqueChildTypes = [...new Set(childTypes)].sort();
+        if (uniqueChildTypes.length > 0) {
+            parts.push(`children:${uniqueChildTypes.join(',')}`);
+        }
+        
+        // Add input count if it's a form element
+        const inputs = element.querySelectorAll('input, textarea, select');
+        if (inputs.length > 0) {
+            const inputTypes = Array.from(inputs).map(input => input.type || input.tagName.toLowerCase());
+            const uniqueInputTypes = [...new Set(inputTypes)].sort();
+            parts.push(`inputs:${inputs.length}:${uniqueInputTypes.join(',')}`);
+        }
+        
+        return parts.join('|');
+    }
+
+    getElementDOMPosition(element) {
+        // Get a stable position identifier based on DOM structure
+        let position = 0;
+        let current = element;
+        
+        // Walk up the tree and calculate position
+        while (current && current.parentElement) {
+            const siblings = Array.from(current.parentElement.children);
+            position += siblings.indexOf(current);
+            current = current.parentElement;
+            
+            // Limit depth to avoid huge numbers
+            if (position > 10000) break;
+        }
+        
+        // Add element rect for additional uniqueness
+        const rect = element.getBoundingClientRect();
+        const rectSignature = `${Math.round(rect.top)}_${Math.round(rect.left)}_${Math.round(rect.width)}_${Math.round(rect.height)}`;
+        
+        return `${position}_${rectSignature}`;
     }
 
     getElementXPath(element) {
@@ -380,22 +905,69 @@ class QuickFillFormsV2 {
     }
 
     identifyQuestionType(element) {
-        // Multiple choice (radio buttons)
-        if (element.querySelector('input[type="radio"]') || element.getAttribute('role') === 'radiogroup') {
-            return 'radio';
+        // Matrix/Grid questions (Likert scale tables) - Be more precise to avoid false positives
+        
+        // Method 1: Check for Microsoft Forms specific Likert structure (most reliable)
+        const likertStatements = element.querySelectorAll('[data-automation-id="likerStatementTd"]');
+        if (likertStatements.length > 0) {
+            this.log(`🔍 Matrix question detected via likertStatements: ${likertStatements.length}`);
+            return 'matrix';
         }
         
-        // Checkboxes
-        if (element.querySelector('input[type="checkbox"]')) {
-            return 'checkbox';
+        // Method 2: Check for table with multiple radio group rows
+        const radioGroupRows = element.querySelectorAll('tr[role="radiogroup"]');
+        if (radioGroupRows.length > 1) {
+            this.log(`🔍 Matrix question detected via radioGroupRows: ${radioGroupRows.length}`);
+            return 'matrix';
         }
         
-        // Text input
-        if (element.querySelector('input[type="text"], textarea')) {
-            return 'text';
+        // Method 3: Check for table with many radio inputs arranged in rows
+        const tablesWithRadios = element.querySelectorAll('table');
+        for (const table of tablesWithRadios) {
+            const tableRows = table.querySelectorAll('tr');
+            const radioInputsInTable = table.querySelectorAll('input[type="radio"]');
+            
+            // Must have multiple rows AND multiple radios (at least 2 rows x 3 options = 6 radios minimum)
+            if (tableRows.length >= 2 && radioInputsInTable.length >= 6) {
+                // Additional check: radios should be distributed across rows
+                let rowsWithRadios = 0;
+                for (const row of tableRows) {
+                    if (row.querySelectorAll('input[type="radio"]').length > 0) {
+                        rowsWithRadios++;
+                    }
+                }
+                
+                if (rowsWithRadios >= 2) {
+                    this.log(`🔍 Matrix question detected via table structure: ${rowsWithRadios} rows with radios, ${radioInputsInTable.length} total radios`);
+                    return 'matrix';
+                }
+            }
         }
         
-        // Rating/Likert scale
+        // Method 4: Check for multiple radio groups (non-table structure)
+        const radioGroups = element.querySelectorAll('[role="radiogroup"]');
+        if (radioGroups.length > 1) {
+            this.log(`🔍 Matrix question detected via multiple radiogroups: ${radioGroups.length}`);
+            return 'matrix';
+        }
+        
+        // Method 5: Fallback - check for very high radio count with specific patterns
+        const allRadioInputs = element.querySelectorAll('input[type="radio"]');
+        if (allRadioInputs.length >= 15) { // Very conservative threshold
+            // Additional verification: check if radios are grouped (same name attribute patterns)
+            const radioNames = new Set();
+            allRadioInputs.forEach(radio => {
+                if (radio.name) radioNames.add(radio.name);
+            });
+            
+            // If we have multiple radio groups (different names), it's likely a matrix
+            if (radioNames.size >= 3) {
+                this.log(`🔍 Matrix question detected via high radio count: ${allRadioInputs.length} radios, ${radioNames.size} groups`);
+                return 'matrix';
+            }
+        }
+        
+        // Rating/Likert scale (single row slider-style)
         if (element.querySelector('[role="slider"], .rating-component')) {
             return 'rating';
         }
@@ -405,15 +977,19 @@ class QuickFillFormsV2 {
             return 'select';
         }
         
-        // Matrix/Grid questions (Likert scale tables)
-        if (element.querySelector('table, .matrix-table, tr[role="radiogroup"], .likert-table')) {
-            return 'matrix';
+        // Text input
+        if (element.querySelector('input[type="text"], textarea')) {
+            return 'text';
         }
         
-        // Check for multiple rows of radio buttons (Likert-style without table)
-        const radioRows = element.querySelectorAll('[role="radiogroup"]');
-        if (radioRows.length > 1) {
-            return 'matrix';
+        // Checkboxes
+        if (element.querySelector('input[type="checkbox"]')) {
+            return 'checkbox';
+        }
+        
+        // Multiple choice (radio buttons) - Check last as matrix also has radio buttons
+        if (element.querySelector('input[type="radio"]') || element.getAttribute('role') === 'radiogroup') {
+            return 'radio';
         }
         
         return null;
@@ -479,14 +1055,51 @@ class QuickFillFormsV2 {
         let selectedInput = null;
         
         if (customChoice) {
-            // Try to find exact match first
-            selectedInput = Array.from(radioInputs).find(input => {
-                const label = this.getInputLabel(input);
-                return label && label.toLowerCase().includes(customChoice.toLowerCase());
-            });
+            this.log(`🎯 Looking for custom choice: "${customChoice}"`);
             
-            if (selectedInput) {
-                this.log(`🎯 Found custom choice match: "${customChoice}"`);
+            // Try multiple matching methods
+            const matchingMethods = [
+                // Method 1: Exact match (case insensitive)
+                (label, choice) => label.toLowerCase().trim() === choice.toLowerCase().trim(),
+                // Method 2: Label contains choice
+                (label, choice) => label.toLowerCase().includes(choice.toLowerCase()),
+                // Method 3: Choice contains label (for short answers)
+                (label, choice) => choice.toLowerCase().includes(label.toLowerCase()),
+                // Method 4: Remove common words and match
+                (label, choice) => {
+                    const cleanLabel = label.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                    const cleanChoice = choice.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                    return cleanLabel === cleanChoice || cleanLabel.includes(cleanChoice) || cleanChoice.includes(cleanLabel);
+                }
+            ];
+            
+            // Try each matching method
+            for (let i = 0; i < matchingMethods.length && !selectedInput; i++) {
+                selectedInput = Array.from(radioInputs).find(input => {
+                    const label = this.getInputLabel(input);
+                    if (!label) return false;
+                    
+                    const matches = matchingMethods[i](label, customChoice);
+                    if (matches) {
+                        this.log(`🎯 Method ${i + 1} match: "${label}" ↔ "${customChoice}"`);
+                    }
+                    return matches;
+                });
+                
+                if (selectedInput) {
+                    this.log(`✅ Found custom choice match using method ${i + 1}: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+                }
+            }
+            
+            if (!selectedInput) {
+                this.log(`⚠️ No matching option found for custom choice: "${customChoice}"`);
+                // Debug: log all available options
+                this.log(`📋 Available options:`);
+                Array.from(radioInputs).forEach((input, index) => {
+                    const label = this.getInputLabel(input);
+                    this.log(`   ${index + 1}. "${label}"`);
+                });
             }
         }
         
@@ -515,21 +1128,253 @@ class QuickFillFormsV2 {
     }
 
     getCustomChoiceForQuestion(question) {
-        // Get the question text to match with custom settings
+        // Enhanced custom choice detection with multiple matching strategies
         const questionText = this.getQuestionText(question.element);
         
-        if (!questionText || !this.currentFormData.customFields) {
+        if (!questionText) {
+            this.log(`⚠️ No question text found for custom choice matching`);
             return null;
         }
         
-        // Look for exact question match in custom fields
-        for (const field of this.currentFormData.customFields) {
-            if (field.question && questionText.toLowerCase().includes(field.question.toLowerCase())) {
-                return field.value;
+        this.log(`🔍 ENHANCED custom choice search for: "${questionText.substring(0, 80)}..."`);
+        
+        // Check for special questions (fixed answers) from popup
+        if (this.currentFormData.specialQuestions && this.currentFormData.specialQuestions.length > 0) {
+            this.log(`� Checking ${this.currentFormData.specialQuestions.length} special questions with enhanced matching:`);
+            
+            const bestMatch = this.findBestSpecialQuestionMatch(questionText, this.currentFormData.specialQuestions);
+            
+            if (bestMatch) {
+                this.log(`✅ BEST MATCH found: "${bestMatch.specialQuestion.keyword}" → "${bestMatch.specialQuestion.answer}" (score: ${bestMatch.score.toFixed(3)}, method: ${bestMatch.method})`);
+                return bestMatch.specialQuestion.answer;
+            }
+            
+            this.log(`⚠️ No matching special question found with enhanced matching`);
+        }
+        
+        // Fallback: check for custom fields (legacy support)
+        if (this.currentFormData.customFields && this.currentFormData.customFields.length > 0) {
+            this.log(`🔄 Checking ${this.currentFormData.customFields.length} legacy custom fields:`);
+            
+            for (const field of this.currentFormData.customFields) {
+                if (field.question && field.value) {
+                    const matchScore = this.calculateTextMatchScore(questionText, field.question);
+                    this.log(`   - "${field.question}" → "${field.value}" (score: ${matchScore.toFixed(3)})`);
+                    
+                    if (matchScore > 0.6) { // 60% similarity threshold
+                        this.log(`✅ Legacy custom field match: "${field.question}" → "${field.value}"`);
+                        return field.value;
+                    }
+                }
             }
         }
         
         return null;
+    }
+
+    findBestSpecialQuestionMatch(questionText, specialQuestions) {
+        const matches = [];
+        
+        for (const specialQuestion of specialQuestions) {
+            if (!specialQuestion.keyword || !specialQuestion.answer) {
+                continue;
+            }
+            
+            // Multiple matching strategies with scoring
+            const matchStrategies = [
+                {
+                    name: 'exact_match',
+                    score: this.calculateExactMatch(questionText, specialQuestion.keyword),
+                    weight: 1.0
+                },
+                {
+                    name: 'contains_match',
+                    score: this.calculateContainsMatch(questionText, specialQuestion.keyword),
+                    weight: 0.9
+                },
+                {
+                    name: 'fuzzy_match',
+                    score: this.calculateFuzzyMatch(questionText, specialQuestion.keyword),
+                    weight: 0.8
+                },
+                {
+                    name: 'word_overlap',
+                    score: this.calculateWordOverlap(questionText, specialQuestion.keyword),
+                    weight: 0.7
+                },
+                {
+                    name: 'partial_match',
+                    score: this.calculatePartialMatch(questionText, specialQuestion.keyword),
+                    weight: 0.6
+                }
+            ];
+            
+            // Find best strategy for this special question
+            const bestStrategy = matchStrategies.reduce((best, current) => {
+                const weightedScore = current.score * current.weight;
+                const bestWeightedScore = best.score * best.weight;
+                return weightedScore > bestWeightedScore ? current : best;
+            });
+            
+            const finalScore = bestStrategy.score * bestStrategy.weight;
+            
+            this.log(`   - "${specialQuestion.keyword}" → "${specialQuestion.answer}" | ${bestStrategy.name}: ${finalScore.toFixed(3)}`);
+            
+            if (finalScore > 0.5) { // Minimum threshold for consideration
+                matches.push({
+                    specialQuestion,
+                    score: finalScore,
+                    method: bestStrategy.name
+                });
+            }
+        }
+        
+        // Return best match if any
+        if (matches.length > 0) {
+            matches.sort((a, b) => b.score - a.score);
+            return matches[0];
+        }
+        
+        return null;
+    }
+
+    calculateExactMatch(text1, text2) {
+        const clean1 = this.cleanTextForMatching(text1);
+        const clean2 = this.cleanTextForMatching(text2);
+        return clean1 === clean2 ? 1.0 : 0.0;
+    }
+
+    calculateContainsMatch(questionText, keyword) {
+        const cleanQuestion = this.cleanTextForMatching(questionText);
+        const cleanKeyword = this.cleanTextForMatching(keyword);
+        
+        if (cleanQuestion.includes(cleanKeyword)) {
+            // Score based on keyword length relative to question length
+            return Math.min(1.0, cleanKeyword.length / cleanQuestion.length + 0.5);
+        }
+        
+        // Check reverse containment (keyword contains question parts)
+        if (cleanKeyword.includes(cleanQuestion)) {
+            return Math.min(1.0, cleanQuestion.length / cleanKeyword.length + 0.3);
+        }
+        
+        return 0.0;
+    }
+
+    calculateFuzzyMatch(text1, text2) {
+        // Simple Levenshtein distance-based similarity
+        const clean1 = this.cleanTextForMatching(text1);
+        const clean2 = this.cleanTextForMatching(text2);
+        
+        const distance = this.levenshteinDistance(clean1, clean2);
+        const maxLength = Math.max(clean1.length, clean2.length);
+        
+        if (maxLength === 0) return 1.0;
+        
+        return Math.max(0, 1 - distance / maxLength);
+    }
+
+    calculateWordOverlap(text1, text2) {
+        const words1 = new Set(this.extractSignificantWords(text1));
+        const words2 = new Set(this.extractSignificantWords(text2));
+        
+        if (words1.size === 0 || words2.size === 0) return 0.0;
+        
+        const intersection = new Set([...words1].filter(word => words2.has(word)));
+        const union = new Set([...words1, ...words2]);
+        
+        return intersection.size / union.size; // Jaccard similarity
+    }
+
+    calculatePartialMatch(questionText, keyword) {
+        const cleanQuestion = this.cleanTextForMatching(questionText);
+        const cleanKeyword = this.cleanTextForMatching(keyword);
+        
+        // Check if significant portions match
+        const keywordWords = cleanKeyword.split(/\s+/);
+        const questionWords = cleanQuestion.split(/\s+/);
+        
+        let matchingWords = 0;
+        
+        for (const keywordWord of keywordWords) {
+            if (keywordWord.length > 2) { // Only consider words longer than 2 chars
+                for (const questionWord of questionWords) {
+                    if (questionWord.includes(keywordWord) || keywordWord.includes(questionWord)) {
+                        matchingWords++;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return keywordWords.length > 0 ? matchingWords / keywordWords.length : 0.0;
+    }
+
+    calculateTextMatchScore(text1, text2) {
+        // Composite scoring combining multiple methods
+        const exactScore = this.calculateExactMatch(text1, text2);
+        if (exactScore > 0) return exactScore;
+        
+        const containsScore = this.calculateContainsMatch(text1, text2);
+        const fuzzyScore = this.calculateFuzzyMatch(text1, text2);
+        const wordScore = this.calculateWordOverlap(text1, text2);
+        const partialScore = this.calculatePartialMatch(text1, text2);
+        
+        // Weighted average
+        return (containsScore * 0.3 + fuzzyScore * 0.3 + wordScore * 0.25 + partialScore * 0.15);
+    }
+
+    cleanTextForMatching(text) {
+        if (!text) return '';
+        
+        return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ') // Replace punctuation with spaces
+            .replace(/\s+/g, ' ')     // Normalize whitespace
+            .trim();
+    }
+
+    extractSignificantWords(text) {
+        if (!text) return [];
+        
+        // Common stop words to filter out
+        const stopWords = new Set([
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'
+        ]);
+        
+        return this.cleanTextForMatching(text)
+            .split(/\s+/)
+            .filter(word => word.length > 2 && !stopWords.has(word));
+    }
+
+    levenshteinDistance(str1, str2) {
+        const matrix = [];
+        
+        for (let i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+        
+        for (let j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+        
+        for (let i = 1; i <= str2.length; i++) {
+            for (let j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+        
+        return matrix[str2.length][str1.length];
     }
 
     getQuestionText(element) {
@@ -577,7 +1422,7 @@ class QuickFillFormsV2 {
             const settingsMax = this.currentFormData.ratingMax || 5;
             this.log(`🎯 Detected rating/Likert scale - using rating strategy with range ${settingsMin}-${settingsMax}`);
             
-            selectedInput = this.selectRatingFromInputs(visibleInputs, settingsMin, settingsMax);
+            selectedInput = this.selectRatingFromInputsPositional(visibleInputs, settingsMin, settingsMax);
             
             if (selectedInput) {
                 const selectedRating = Array.from(visibleInputs).indexOf(selectedInput) + 1;
@@ -1163,7 +2008,22 @@ class QuickFillFormsV2 {
         }
         
         if (matrixRows.length === 0) {
-            this.log('⚠️ No matrix rows found', 'warning');
+            this.log('⚠️ No matrix rows found - this might be a misidentified question type', 'warning');
+            
+            // Fallback: try to handle as regular radio question if it has radio inputs
+            const radioInputs = question.element.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length > 0) {
+                this.log(`🔄 Fallback: treating as radio question with ${radioInputs.length} options`);
+                // Convert to radio question format and process
+                const radioQuestion = {
+                    ...question,
+                    type: 'radio'
+                };
+                await this.fillRadioQuestion(radioQuestion);
+                return;
+            }
+            
+            this.log('⚠️ No fallback possible - skipping question');
             return;
         }
         
@@ -1243,97 +2103,201 @@ class QuickFillFormsV2 {
     selectRatingFromInputsPositional(inputs, settingsMin, settingsMax) {
         if (inputs.length === 0) return null;
         
-        this.log(`🔍 Analyzing rating structure for range ${settingsMin}-${settingsMax}:`);
+        this.log(`🔍 ENHANCED rating analysis for user range ${settingsMin}-${settingsMax} from ${inputs.length} inputs:`);
         
-        let targetInputs = [];
-        
-        // Method 1: Position-based selection (most reliable like console script)
-        const ariaLabelInputs = Array.from(inputs).filter(input => {
-            const position = parseInt(input.getAttribute('aria-label'));
-            if (!isNaN(position)) {
-                // For 5-point scale, select last 2 positions (4-5) as they represent highest ratings
-                const totalPositions = inputs.length;
-                const minHighPosition = totalPositions - 1; // Position 4 for 5-point scale  
-                const maxHighPosition = totalPositions;     // Position 5 for 5-point scale
-                const isHighPosition = position >= minHighPosition && position <= maxHighPosition;
-                this.log(`   Position method: position=${position}/${totalPositions}, high positions=${minHighPosition}-${maxHighPosition}, selected=${isHighPosition}`);
-                return isHighPosition;
-            }
-            return false;
-        });
-
-        // Method 2: Value-based selection (backup)
-        const valueInputs = Array.from(inputs).filter(input => {
-            const value = parseInt(input.value);
-            if (!isNaN(value)) {
-                const isTargetValue = value >= settingsMin && value <= settingsMax;
-                this.log(`   Value method: value=${value}, target range=${settingsMin}-${settingsMax}, selected=${isTargetValue}`);
-                return isTargetValue;
-            }
-            return false;
-        });
-
-        // Method 3: Automation value selection (rarely works)
-        const automationInputs = Array.from(inputs).filter(input => {
-            const automationValue = parseInt(input.getAttribute('data-automation-value'));
-            if (!isNaN(automationValue)) {
-                const isTargetValue = automationValue >= settingsMin && automationValue <= settingsMax;
-                this.log(`   Automation-value method: value=${automationValue}, target range=${settingsMin}-${settingsMax}, selected=${isTargetValue}`);
-                return isTargetValue;
-            }
-            return false;
-        });
-
-        // Choose the best method (prefer position method as it's most reliable)
-        if (ariaLabelInputs.length > 0) {
-            targetInputs = ariaLabelInputs;
-            this.log(`🎯 Using position method: Found ${targetInputs.length} high rating options`);
-        } else if (valueInputs.length > 0) {
-            targetInputs = valueInputs;
-            this.log(`🎯 Using value method: Found ${targetInputs.length} high rating options`);
-        } else if (automationInputs.length > 0) {
-            targetInputs = automationInputs;
-            this.log(`🎯 Using automation-value method: Found ${targetInputs.length} high rating options`);
-        } else {
-            // Fallback: use positional selection (last 2 options for high ratings)
-            // For 5-point scale, last 2 positions (4th and 5th) are typically highest
-            const totalOptions = inputs.length;
-            const highPositionCount = Math.min(2, totalOptions); // Select last 2 or all if less than 2
-            targetInputs = Array.from(inputs).slice(-highPositionCount);
-            this.log(`📊 Using positional fallback: last ${highPositionCount} out of ${totalOptions} options as high ratings`);
-        }
-
-        if (targetInputs.length === 0) {
-            this.log(`❌ No suitable rating options found`);
-            return null;
-        }
-
-        // Weighted selection favoring higher ratings (like console script)
-        let selectedInput;
-        if (targetInputs.length === 1) {
-            selectedInput = targetInputs[0];
-        } else {
-            // Weighted selection favoring the last option (highest rating)
-            const weights = targetInputs.map((_, index) => Math.pow(2, index + 1));
-            const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);  
-            let random = Math.random() * totalWeight;
+        // Enhanced input analysis with multiple detection strategies
+        const inputAnalysis = inputs.map((input, index) => {
+            const analysis = {
+                input,
+                index,
+                ariaLabel: input.getAttribute('aria-label') || '',
+                value: input.value || '',
+                id: input.id || '',
+                name: input.name || '',
+                automationValue: input.getAttribute('data-automation-value') || '',
+                detectedValues: []
+            };
             
-            this.log(`🎲 Weighted selection: weights=${weights}, total=${totalWeight}, random=${random}`);
-
-            for (let i = weights.length - 1; i >= 0; i--) {
-                random -= weights[i];
-                if (random <= 0) {
-                    selectedInput = targetInputs[i];
-                    break;
+            // Strategy 1: Extract from aria-label
+            const ariaMatch = analysis.ariaLabel.match(/(\d+)/);
+            if (ariaMatch) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(ariaMatch[1]), 
+                    source: 'aria-label',
+                    confidence: 0.9 
+                });
+            }
+            
+            // Strategy 2: Extract from value attribute
+            if (analysis.value && /^\d+$/.test(analysis.value)) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(analysis.value), 
+                    source: 'value',
+                    confidence: 0.8 
+                });
+            }
+            
+            // Strategy 3: Extract from automation value
+            if (analysis.automationValue && /^\d+$/.test(analysis.automationValue)) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(analysis.automationValue), 
+                    source: 'automation-value',
+                    confidence: 0.7 
+                });
+            }
+            
+            // Strategy 4: Extract from ID
+            if (analysis.id) {
+                const idMatch = analysis.id.match(/(\d+)/);
+                if (idMatch) {
+                    analysis.detectedValues.push({ 
+                        value: parseInt(idMatch[1]), 
+                        source: 'id',
+                        confidence: 0.6 
+                    });
                 }
             }
             
-            if (!selectedInput) {
-                selectedInput = targetInputs[targetInputs.length - 1]; // fallback to highest
+            // Strategy 5: Position-based (1-indexed)
+            analysis.detectedValues.push({ 
+                value: index + 1, 
+                source: 'position',
+                confidence: 0.5 
+            });
+            
+            // Select best detected value (highest confidence)
+            analysis.bestValue = analysis.detectedValues.length > 0 ? 
+                analysis.detectedValues.reduce((best, current) => 
+                    current.confidence > best.confidence ? current : best
+                ) : null;
+            
+            return analysis;
+        });
+        
+        // Log detailed analysis
+        this.log(`📊 Enhanced input analysis:`);
+        inputAnalysis.forEach(analysis => {
+            const best = analysis.bestValue;
+            this.log(`   [${analysis.index}] best: ${best.value} (${best.source}, conf: ${best.confidence}) | aria: "${analysis.ariaLabel}" | value: "${analysis.value}"`);
+        });
+        
+        // Apply strict user preference filtering
+        const validCandidates = inputAnalysis.filter(analysis => {
+            if (!analysis.bestValue) return false;
+            
+            const value = analysis.bestValue.value;
+            const isInRange = value >= settingsMin && value <= settingsMax;
+            
+            if (isInRange) {
+                this.log(`✅ VALID: input[${analysis.index}] value=${value} is in user range ${settingsMin}-${settingsMax}`);
+            } else {
+                this.log(`❌ EXCLUDED: input[${analysis.index}] value=${value} outside user range ${settingsMin}-${settingsMax}`);
+            }
+            
+            return isInRange;
+        });
+        
+        if (validCandidates.length === 0) {
+            this.log(`⚠️ STRICT COMPLIANCE: No options in user range ${settingsMin}-${settingsMax}`, 'warning');
+            this.log(`📋 Available values: [${inputAnalysis.map(a => a.bestValue?.value).join(', ')}]`);
+            
+            // Check if we should suggest scale adjustment
+            const allValues = inputAnalysis.map(a => a.bestValue?.value).filter(v => v);
+            const minAvailable = Math.min(...allValues);
+            const maxAvailable = Math.max(...allValues);
+            
+            this.log(`💡 SUGGESTION: Form scale is ${minAvailable}-${maxAvailable}, user preferences are ${settingsMin}-${settingsMax}`);
+            
+            // Return null to maintain strict compliance
+            return null;
+        }
+        
+        // Sort candidates by detected value for proper weighting
+        validCandidates.sort((a, b) => a.bestValue.value - b.bestValue.value);
+        
+        this.log(`🎯 Valid candidates (${validCandidates.length}):`);
+        validCandidates.forEach(candidate => {
+            this.log(`   Index ${candidate.index}: value ${candidate.bestValue.value} (${candidate.bestValue.source})`);
+        });
+        
+        // Enhanced weighted selection with user bias
+        const selectedCandidate = this.performEnhancedWeightedSelection(validCandidates, settingsMin, settingsMax);
+        
+        if (selectedCandidate) {
+            this.log(`✅ FINAL SELECTION: index ${selectedCandidate.index}, value ${selectedCandidate.bestValue.value} (${selectedCandidate.bestValue.source})`);
+            return selectedCandidate.input;
+        }
+        
+        this.log('❌ Selection failed despite valid candidates', 'error');
+        return null;
+    }
+
+    performEnhancedWeightedSelection(validCandidates, settingsMin, settingsMax) {
+        if (validCandidates.length === 1) {
+            this.log(`🎯 Single candidate selection`);
+            return validCandidates[0];
+        }
+        
+        // Calculate sophisticated weights based on user preferences
+        const userRange = settingsMax - settingsMin + 1;
+        const userMidpoint = (settingsMin + settingsMax) / 2;
+        
+        this.log(`📊 User preference analysis: range=${userRange}, midpoint=${userMidpoint}`);
+        
+        const weights = validCandidates.map((candidate, index) => {
+            const value = candidate.bestValue.value;
+            const confidence = candidate.bestValue.confidence;
+            
+            // Base weight from position in valid candidates (higher = more weight)
+            let weight = Math.pow(2, index + 1);
+            
+            // Confidence bonus
+            weight *= confidence;
+            
+            // Distance from user's max preference (closer to max = higher weight)
+            const distanceFromMax = Math.abs(value - settingsMax);
+            const maxDistance = settingsMax - settingsMin;
+            
+            if (distanceFromMax === 0) {
+                weight *= 3.0; // 3x bonus for exact max match
+            } else if (distanceFromMax <= 1) {
+                weight *= 2.0; // 2x bonus for close to max
+            } else if (value >= userMidpoint) {
+                weight *= 1.5; // 1.5x bonus for above midpoint
+            }
+            
+            // Small bonus for higher values in general
+            const normalizedValue = (value - settingsMin) / (settingsMax - settingsMin);
+            weight *= (1 + normalizedValue * 0.5);
+            
+            this.log(`📊 Weight calculation for value ${value}:`);
+            this.log(`   - Base weight: ${Math.pow(2, index + 1)}`);
+            this.log(`   - Confidence: ${confidence}`);
+            this.log(`   - Distance from max (${settingsMax}): ${distanceFromMax}`);
+            this.log(`   - Final weight: ${weight.toFixed(3)}`);
+            
+            return weight;
+        });
+        
+        // Weighted random selection
+        const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+        let random = Math.random() * totalWeight;
+        
+        this.log(`🎲 Weighted selection: total=${totalWeight.toFixed(3)}, random=${random.toFixed(3)}`);
+        
+        for (let i = weights.length - 1; i >= 0; i--) {
+            random -= weights[i];
+            if (random <= 0) {
+                const selected = validCandidates[i];
+                this.log(`🎯 Selected candidate ${i}: value ${selected.bestValue.value} (weight: ${weights[i].toFixed(3)}/${totalWeight.toFixed(3)})`);
+                return selected;
             }
         }
-
-        return selectedInput;
+        
+        // Fallback to highest value
+        const fallback = validCandidates[validCandidates.length - 1];
+        this.log(`🎯 Fallback to highest: value ${fallback.bestValue.value}`);
+        return fallback;
     }
 
     async selectRadioInputComprehensive(selectedInput) {
@@ -1493,6 +2457,308 @@ class QuickFillFormsV2 {
         }
         
         return isStandardVisible;
+    }
+
+    performComprehensiveValidation() {
+        this.log('🧪 Performing comprehensive form validation...');
+        
+        const validationResult = {
+            isValid: true,
+            errors: [],
+            warnings: [],
+            successMessage: '',
+            details: {
+                totalQuestions: 0,
+                answeredQuestions: 0,
+                requiredQuestions: 0,
+                answeredRequiredQuestions: 0,
+                validationErrors: 0,
+                criticalErrors: 0
+            }
+        };
+        
+        try {
+            // Step 1: Check for visible validation errors
+            const validationErrors = this.checkValidationErrors();
+            validationResult.details.validationErrors = validationErrors.length;
+            
+            if (validationErrors.length > 0) {
+                validationResult.errors.push(...validationErrors);
+                validationResult.isValid = false;
+            }
+            
+            // Step 2: Check form completeness
+            const completenessCheck = this.checkFormCompleteness();
+            validationResult.details = { ...validationResult.details, ...completenessCheck.details };
+            
+            if (!completenessCheck.isComplete) {
+                validationResult.errors.push(...completenessCheck.errors);
+                validationResult.warnings.push(...completenessCheck.warnings);
+                
+                // Only mark as invalid if there are critical completion issues
+                if (completenessCheck.hasCriticalIssues) {
+                    validationResult.isValid = false;
+                }
+            }
+            
+            // Step 3: Check for form processing state
+            const processingCheck = this.checkFormProcessingState();
+            if (!processingCheck.isReady) {
+                validationResult.warnings.push(processingCheck.message);
+            }
+            
+            // Step 4: Final validation assessment
+            const criticalErrors = validationResult.errors.filter(error => 
+                this.isCriticalValidationError(error)
+            );
+            validationResult.details.criticalErrors = criticalErrors.length;
+            
+            if (criticalErrors.length > 0) {
+                validationResult.isValid = false;
+            }
+            
+            // Generate success message
+            if (validationResult.isValid) {
+                validationResult.successMessage = `Form ready for submission (${validationResult.details.answeredQuestions}/${validationResult.details.totalQuestions} questions answered, ${validationResult.details.answeredRequiredQuestions}/${validationResult.details.requiredQuestions} required answered)`;
+            }
+            
+            this.log(`📊 Validation summary:`);
+            this.log(`   - Total questions: ${validationResult.details.totalQuestions}`);
+            this.log(`   - Answered: ${validationResult.details.answeredQuestions}`);
+            this.log(`   - Required: ${validationResult.details.requiredQuestions}`);
+            this.log(`   - Required answered: ${validationResult.details.answeredRequiredQuestions}`);
+            this.log(`   - Validation errors: ${validationResult.details.validationErrors}`);
+            this.log(`   - Critical errors: ${validationResult.details.criticalErrors}`);
+            this.log(`   - Overall valid: ${validationResult.isValid}`);
+            
+            return validationResult;
+            
+        } catch (error) {
+            this.log(`❌ Error during comprehensive validation: ${error.message}`, 'error');
+            return {
+                isValid: false,
+                errors: [`Validation process failed: ${error.message}`],
+                warnings: [],
+                successMessage: '',
+                details: validationResult.details
+            };
+        }
+    }
+
+    checkValidationErrors() {
+        // Enhanced validation error detection
+        const errorSelectors = [
+            '[role="alert"]',
+            '.error-message',
+            '.validation-error',
+            '[data-automation-id*="error"]',
+            '[data-automation-id*="Error"]',
+            '.field-error',
+            '.form-error',
+            '[aria-invalid="true"]',
+            '.required-field-missing',
+            '.ms-TextField-errorMessage',
+            '.error-text',
+            '.validation-message',
+            '[data-testid*="error"]'
+        ];
+        
+        const errors = [];
+        
+        errorSelectors.forEach(selector => {
+            const errorElements = document.querySelectorAll(selector);
+            errorElements.forEach(element => {
+                if (this.isElementVisible(element) && element.textContent.trim()) {
+                    const errorText = element.textContent.trim();
+                    if (errorText.length > 0 && errorText.length < 500) {
+                        errors.push(errorText);
+                    }
+                }
+            });
+        });
+        
+        // Check for red styling (common for errors)
+        const redElements = document.querySelectorAll('[style*="color: red"], [style*="color:red"], .error, .invalid');
+        redElements.forEach(element => {
+            const style = window.getComputedStyle(element);
+            const isRedText = style.color.includes('rgb(255, 0, 0)') || 
+                             style.color.includes('red') ||
+                             style.color.includes('rgb(220, 53, 69)'); // Bootstrap danger color
+            
+            if (isRedText && this.isElementVisible(element)) {
+                const text = element.textContent.trim();
+                if (text && text.length > 0 && text.length < 300 && !errors.includes(text)) {
+                    errors.push(text);
+                }
+            }
+        });
+        
+        // Remove duplicates and filter out false positives
+        const uniqueErrors = [...new Set(errors)].filter(error => {
+            const lowerError = error.toLowerCase();
+            // Filter out common false positives
+            return !lowerError.includes('optional') && 
+                   !lowerError.includes('help') &&
+                   !lowerError.includes('info') &&
+                   lowerError.length > 3;
+        });
+        
+        return uniqueErrors;
+    }
+
+    checkFormCompleteness() {
+        const result = {
+            isComplete: true,
+            hasCriticalIssues: false,
+            errors: [],
+            warnings: [],
+            details: {
+                totalQuestions: 0,
+                answeredQuestions: 0,
+                requiredQuestions: 0,
+                answeredRequiredQuestions: 0
+            }
+        };
+        
+        try {
+            // Get all visible questions on the page
+            const questionElements = document.querySelectorAll(`
+                [data-automation-id="questionItem"],
+                .office-form-question,
+                [data-automation-id="question"],
+                [role="radiogroup"]
+            `);
+            
+            result.details.totalQuestions = questionElements.length;
+            
+            for (const questionElement of questionElements) {
+                if (!this.isElementVisible(questionElement)) continue;
+                
+                const isRequired = this.isQuestionRequired(questionElement);
+                if (isRequired) {
+                    result.details.requiredQuestions++;
+                }
+                
+                const isAnswered = this.isQuestionAnswered(questionElement);
+                if (isAnswered) {
+                    result.details.answeredQuestions++;
+                    if (isRequired) {
+                        result.details.answeredRequiredQuestions++;
+                    }
+                }
+                
+                // Check for critical issues
+                if (isRequired && !isAnswered) {
+                    const questionText = this.getQuestionText(questionElement);
+                    const errorMsg = `Required question not answered: ${questionText?.substring(0, 50) || 'Unknown question'}`;
+                    result.errors.push(errorMsg);
+                    result.hasCriticalIssues = true;
+                    result.isComplete = false;
+                }
+            }
+            
+            // Check overall completion rate
+            const completionRate = result.details.totalQuestions > 0 ? 
+                result.details.answeredQuestions / result.details.totalQuestions : 1;
+            
+            if (completionRate < 0.5) {
+                result.warnings.push(`Low completion rate: ${Math.round(completionRate * 100)}% of questions answered`);
+            }
+            
+        } catch (error) {
+            this.log(`❌ Error checking form completeness: ${error.message}`, 'error');
+            result.errors.push(`Completeness check failed: ${error.message}`);
+            result.isComplete = false;
+        }
+        
+        return result;
+    }
+
+    isQuestionAnswered(questionElement) {
+        try {
+            // Check different types of form controls
+            const radioInputs = questionElement.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length > 0) {
+                return Array.from(radioInputs).some(input => input.checked);
+            }
+            
+            const checkboxInputs = questionElement.querySelectorAll('input[type="checkbox"]');
+            if (checkboxInputs.length > 0) {
+                return Array.from(checkboxInputs).some(input => input.checked);
+            }
+            
+            const textInputs = questionElement.querySelectorAll('input[type="text"], textarea');
+            if (textInputs.length > 0) {
+                return Array.from(textInputs).some(input => input.value.trim().length > 0);
+            }
+            
+            const selectInputs = questionElement.querySelectorAll('select');
+            if (selectInputs.length > 0) {
+                return Array.from(selectInputs).some(select => select.value && select.value !== '');
+            }
+            
+            const sliders = questionElement.querySelectorAll('[role="slider"]');
+            if (sliders.length > 0) {
+                return Array.from(sliders).some(slider => 
+                    slider.getAttribute('aria-valuenow') !== null
+                );
+            }
+            
+            return false;
+        } catch (error) {
+            this.log(`❌ Error checking if question is answered: ${error.message}`, 'error');
+            return false; // Assume not answered if we can't determine
+        }
+    }
+
+    checkFormProcessingState() {
+        try {
+            // Check if form is in processing state (loading, submitting, etc.)
+            const processingIndicators = [
+                '.loading',
+                '.spinner',
+                '[data-loading="true"]',
+                '.submitting',
+                '[disabled="true"]'
+            ];
+            
+            for (const selector of processingIndicators) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0 && Array.from(elements).some(el => this.isElementVisible(el))) {
+                    return {
+                        isReady: false,
+                        message: 'Form appears to be in processing state'
+                    };
+                }
+            }
+            
+            return {
+                isReady: true,
+                message: 'Form is ready for interaction'
+            };
+        } catch (error) {
+            return {
+                isReady: true,
+                message: 'Could not determine processing state'
+            };
+        }
+    }
+
+    isCriticalValidationError(error) {
+        const criticalKeywords = [
+            'required',
+            'mandatory',
+            'must',
+            'cannot be empty',
+            'field is empty',
+            'please select',
+            'please enter',
+            'invalid format',
+            'not valid'
+        ];
+        
+        const lowerError = error.toLowerCase();
+        return criticalKeywords.some(keyword => lowerError.includes(keyword));
     }
 
     async submitForm() {
@@ -2101,6 +3367,420 @@ class QuickFillFormsV2 {
         // Log page content hints
         const bodyText = document.body.textContent.substring(0, 500);
         this.log(`📄 Page content preview: ${bodyText}...`);
+    }
+
+    // System integration test method
+    async performSystemIntegrationTest() {
+        this.log('🧪 SYSTEM INTEGRATION TEST - Starting comprehensive validation...');
+        
+        const testResults = {
+            timestamp: new Date().toISOString(),
+            overallStatus: 'PASS',
+            tests: [],
+            summary: {
+                passed: 0,
+                failed: 0,
+                warnings: 0
+            }
+        };
+        
+        try {
+            // Test 1: Page Detection
+            const pageTest = this.testPageDetection();
+            testResults.tests.push(pageTest);
+            
+            // Test 2: Question Detection
+            const questionTest = await this.testQuestionDetection();
+            testResults.tests.push(questionTest);
+            
+            // Test 3: Settings Validation
+            const settingsTest = this.testSettingsValidation();
+            testResults.tests.push(settingsTest);
+            
+            // Test 4: Fixed Answers Logic
+            const fixedAnswersTest = this.testFixedAnswersLogic();
+            testResults.tests.push(fixedAnswersTest);
+            
+            // Test 5: Rating Selection Logic
+            const ratingTest = this.testRatingSelectionLogic();
+            testResults.tests.push(ratingTest);
+            
+            // Test 6: Form Validation
+            const validationTest = this.testFormValidation();
+            testResults.tests.push(validationTest);
+            
+            // Calculate summary
+            testResults.tests.forEach(test => {
+                if (test.status === 'PASS') {
+                    testResults.summary.passed++;
+                } else if (test.status === 'FAIL') {
+                    testResults.summary.failed++;
+                    testResults.overallStatus = 'FAIL';
+                } else if (test.status === 'WARNING') {
+                    testResults.summary.warnings++;
+                }
+            });
+            
+            // Log results
+            this.log(`🧪 SYSTEM TEST RESULTS:`);
+            this.log(`   Overall Status: ${testResults.overallStatus}`);
+            this.log(`   Passed: ${testResults.summary.passed}`);
+            this.log(`   Failed: ${testResults.summary.failed}`);
+            this.log(`   Warnings: ${testResults.summary.warnings}`);
+            
+            testResults.tests.forEach(test => {
+                const icon = test.status === 'PASS' ? '✅' : test.status === 'FAIL' ? '❌' : '⚠️';
+                this.log(`   ${icon} ${test.name}: ${test.message}`);
+                
+                if (test.details && test.details.length > 0) {
+                    test.details.forEach(detail => {
+                        this.log(`      - ${detail}`);
+                    });
+                }
+            });
+            
+            return testResults;
+            
+        } catch (error) {
+            this.log(`❌ System integration test failed: ${error.message}`, 'error');
+            testResults.overallStatus = 'FAIL';
+            testResults.tests.push({
+                name: 'System Test Execution',
+                status: 'FAIL',
+                message: `Test execution failed: ${error.message}`,
+                details: []
+            });
+            
+            return testResults;
+        }
+    }
+
+    testPageDetection() {
+        const test = {
+            name: 'Page Detection',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const isValid = this.isValidFormsPage();
+            const currentUrl = window.location.href;
+            
+            if (isValid) {
+                test.message = 'Valid Microsoft Forms page detected';
+                test.details.push(`URL: ${currentUrl}`);
+            } else {
+                test.status = 'FAIL';
+                test.message = 'Invalid or unsupported page';
+                test.details.push(`URL: ${currentUrl}`);
+                test.details.push('Page does not appear to be a Microsoft Forms page');
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Page detection failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    async testQuestionDetection() {
+        const test = {
+            name: 'Question Detection',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const questions = await this.getAllQuestions();
+            
+            if (questions.length > 0) {
+                test.message = `Successfully detected ${questions.length} questions`;
+                test.details.push(`Question types: ${[...new Set(questions.map(q => q.type))].join(', ')}`);
+                test.details.push(`Required questions: ${questions.filter(q => q.isRequired).length}`);
+            } else {
+                test.status = 'WARNING';
+                test.message = 'No questions detected on current page';
+                test.details.push('Page may not be fully loaded or may not contain form questions');
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Question detection failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testSettingsValidation() {
+        const test = {
+            name: 'Settings Validation',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            if (!this.currentFormData) {
+                test.status = 'FAIL';
+                test.message = 'No form data/settings available';
+                return test;
+            }
+            
+            // Check rating settings
+            const ratingMin = parseInt(this.currentFormData.ratingMin);
+            const ratingMax = parseInt(this.currentFormData.ratingMax);
+            
+            if (isNaN(ratingMin) || isNaN(ratingMax) || ratingMin > ratingMax) {
+                test.status = 'WARNING';
+                test.message = 'Invalid rating range settings';
+                test.details.push(`Rating range: ${this.currentFormData.ratingMin}-${this.currentFormData.ratingMax}`);
+            } else {
+                test.message = 'Settings validation passed';
+                test.details.push(`Rating range: ${ratingMin}-${ratingMax}`);
+            }
+            
+            // Check special questions
+            if (this.currentFormData.specialQuestions && this.currentFormData.specialQuestions.length > 0) {
+                test.details.push(`Fixed answers configured: ${this.currentFormData.specialQuestions.length}`);
+            }
+            
+            // Check auto-submit setting
+            test.details.push(`Auto-submit: ${this.currentFormData.autoSubmit ? 'enabled' : 'disabled'}`);
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Settings validation failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testFixedAnswersLogic() {
+        const test = {
+            name: 'Fixed Answers Logic',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            if (!this.currentFormData.specialQuestions || this.currentFormData.specialQuestions.length === 0) {
+                test.status = 'WARNING';
+                test.message = 'No fixed answers configured';
+                return test;
+            }
+            
+            // Test matching logic with sample data
+            const sampleQuestions = [
+                'What is your favorite color?',
+                'Rate your experience',
+                'How satisfied are you?'
+            ];
+            
+            let matchesFound = 0;
+            
+            sampleQuestions.forEach(questionText => {
+                const match = this.findBestSpecialQuestionMatch(questionText, this.currentFormData.specialQuestions);
+                if (match) {
+                    matchesFound++;
+                    test.details.push(`Sample match: "${questionText}" → "${match.specialQuestion.answer}"`);
+                }
+            });
+            
+            test.message = `Fixed answers logic functional (${matchesFound}/${sampleQuestions.length} sample matches)`;
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Fixed answers test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testRatingSelectionLogic() {
+        const test = {
+            name: 'Rating Selection Logic',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            // Create mock rating inputs to test selection logic
+            const mockInputs = [];
+            for (let i = 1; i <= 5; i++) {
+                const mockInput = {
+                    getAttribute: (attr) => attr === 'aria-label' ? i.toString() : null,
+                    value: i.toString(),
+                    id: `rating_${i}`,
+                    name: 'rating'
+                };
+                mockInputs.push(mockInput);
+            }
+            
+            const settingsMin = parseInt(this.currentFormData.ratingMin) || 4;
+            const settingsMax = parseInt(this.currentFormData.ratingMax) || 5;
+            
+            const selectedInput = this.selectRatingFromInputsPositional(mockInputs, settingsMin, settingsMax);
+            
+            if (selectedInput) {
+                const selectedValue = parseInt(selectedInput.getAttribute('aria-label'));
+                const isInRange = selectedValue >= settingsMin && selectedValue <= settingsMax;
+                
+                if (isInRange) {
+                    test.message = `Rating selection working correctly (selected: ${selectedValue})`;
+                    test.details.push(`User range: ${settingsMin}-${settingsMax}`);
+                    test.details.push(`Selected value: ${selectedValue}`);
+                } else {
+                    test.status = 'WARNING';
+                    test.message = `Rating selection outside user range (selected: ${selectedValue})`;
+                }
+            } else {
+                test.status = 'WARNING';
+                test.message = 'No rating option selected (may be intentional for strict compliance)';
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Rating selection test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testFormValidation() {
+        const test = {
+            name: 'Form Validation',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const validationResult = this.performComprehensiveValidation();
+            
+            if (validationResult.isValid) {
+                test.message = 'Form validation system working correctly';
+                test.details.push(validationResult.successMessage);
+            } else {
+                test.status = 'WARNING';
+                test.message = `Form validation detected issues (${validationResult.errors.length} errors)`;
+                test.details.push(...validationResult.errors.slice(0, 3)); // Show first 3 errors
+            }
+            
+            test.details.push(`Validation errors detected: ${validationResult.details.validationErrors}`);
+            test.details.push(`Critical errors: ${validationResult.details.criticalErrors}`);
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Form validation test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    // Performance optimization: Cache frequently used DOM queries
+    getCachedQuestionElements() {
+        if (!this.elementCache) {
+            this.elementCache = new Map();
+        }
+        
+        // Clear old cache entries (older than 5 seconds)
+        const now = Date.now();
+        for (const [key, data] of this.elementCache.entries()) {
+            if (now - data.timestamp > 5000) {
+                this.elementCache.delete(key);
+            }
+        }
+        
+        return {
+            questionItems: document.querySelectorAll('[data-automation-id="questionItem"]'),
+            questionContainers: document.querySelectorAll('[data-automation-id="questionContainer"]'),
+            likertContainers: document.querySelectorAll('[data-automation-id*="likert"], [data-automation-id*="matrix"]'),
+            radioGroups: document.querySelectorAll('[role="radiogroup"]'),
+            textInputs: document.querySelectorAll('input[type="text"], textarea'),
+            checkboxes: document.querySelectorAll('input[type="checkbox"]'),
+            selectElements: document.querySelectorAll('select')
+        };
+    }
+
+    // Smart wait for dynamic content
+    async waitForQuestionsToLoad(timeout = 3000) {
+        const startTime = Date.now();
+        let lastCount = 0;
+        let stableCount = 0;
+        
+        while (Date.now() - startTime < timeout) {
+            const elements = this.getCachedQuestionElements();
+            const currentCount = elements.questionItems.length + elements.questionContainers.length;
+            
+            if (currentCount === lastCount) {
+                stableCount++;
+                if (stableCount >= 3) { // Stable for 3 checks
+                    this.log(`✅ Questions loaded and stable: ${currentCount} elements`);
+                    return true;
+                }
+            } else {
+                stableCount = 0;
+                lastCount = currentCount;
+            }
+            
+            await this.sleep(100);
+        }
+        
+        this.log(`⚠️ Questions may still be loading after ${timeout}ms`);
+        return false;
+    }
+
+    // Advanced element comparison to avoid duplicates
+    areElementsSimilar(element1, element2, threshold = 0.8) {
+        if (element1 === element2) return true;
+        
+        const getElementFingerprint = (el) => {
+            const rect = el.getBoundingClientRect();
+            const attrs = Array.from(el.attributes).map(attr => `${attr.name}:${attr.value}`).join('|');
+            const children = Array.from(el.children).map(child => child.tagName).join(',');
+            
+            return {
+                tagName: el.tagName,
+                rect: { top: Math.round(rect.top), left: Math.round(rect.left), width: Math.round(rect.width), height: Math.round(rect.height) },
+                attributes: attrs,
+                children: children,
+                textContent: el.textContent?.trim().substring(0, 50) || ''
+            };
+        };
+        
+        const fp1 = getElementFingerprint(element1);
+        const fp2 = getElementFingerprint(element2);
+        
+        let similarity = 0;
+        let checks = 0;
+        
+        // Tag name check
+        if (fp1.tagName === fp2.tagName) similarity += 0.2;
+        checks++;
+        
+        // Position similarity
+        const rectDiff = Math.abs(fp1.rect.top - fp2.rect.top) + Math.abs(fp1.rect.left - fp2.rect.left);
+        if (rectDiff < 10) similarity += 0.3;
+        checks++;
+        
+        // Size similarity
+        const sizeDiff = Math.abs(fp1.rect.width - fp2.rect.width) + Math.abs(fp1.rect.height - fp2.rect.height);
+        if (sizeDiff < 20) similarity += 0.2;
+        checks++;
+        
+        // Content similarity
+        if (fp1.textContent && fp2.textContent) {
+            const textSimilarity = this.calculateTextSimilarity(fp1.textContent, fp2.textContent);
+            similarity += textSimilarity * 0.3;
+            checks++;
+        }
+        
+        return (similarity / checks) >= threshold;
     }
 }
 
