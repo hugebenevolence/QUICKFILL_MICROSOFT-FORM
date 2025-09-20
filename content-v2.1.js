@@ -15,8 +15,9 @@ class QuickFillFormsV2 {
         this.currentFormData = {};
         this.processedQuestions = new Set(); // Track processed questions per page
         this.submitCount = 0; // Counter for submitted forms
-        this.sessionStartTime = Date.now(); // Track session start
+        this.sessionStartTime = null; // Will be set when starting
         this.setupMessageListener();
+        this.restoreSession(); // Restore session if exists
         this.log('🎯 QuickFill v2.1 initialized');
     }
 
@@ -33,10 +34,14 @@ class QuickFillFormsV2 {
             this.log(`📊 Form submitted! Total: ${this.submitCount}`, 'success');
         }
         
+        // Save updated count to storage
+        this.saveSessionToStorage();
+        
         // Send update to popup
         this.sendStatusUpdate({
             submitCount: this.submitCount,
-            sessionDuration: Date.now() - this.sessionStartTime,
+            sessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0,
+            sessionStartTime: this.sessionStartTime,
             isRunning: this.isRunning
         });
     }
@@ -52,6 +57,47 @@ class QuickFillFormsV2 {
             });
         } catch (error) {
             this.log(`Error sending status update: ${error.message}`);
+        }
+    }
+
+    async saveSessionToStorage() {
+        try {
+            const sessionData = {
+                sessionStartTime: this.sessionStartTime,
+                sessionActive: this.isRunning,
+                submitCount: this.submitCount
+            };
+            
+            await chrome.storage.local.set(sessionData);
+            console.log(`💾 Session data saved to storage:`, sessionData);
+            console.log(`   - Start time: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+            console.log(`   - Active: ${this.isRunning}`);
+            console.log(`   - Submit count: ${this.submitCount}`);
+        } catch (error) {
+            console.error(`❌ Error saving session data: ${error.message}`);
+        }
+    }
+
+    async restoreSession() {
+        try {
+            const sessionData = await chrome.storage.local.get([
+                'sessionStartTime', 'sessionActive', 'submitCount'
+            ]);
+
+            if (sessionData.sessionActive && sessionData.sessionStartTime) {
+                this.sessionStartTime = sessionData.sessionStartTime;
+                this.submitCount = sessionData.submitCount || 0;
+                this.log(`🔄 Restored session: start=${this.sessionStartTime}, count=${this.submitCount}`);
+                
+                // Send restored state to popup
+                this.sendStatusUpdate({
+                    submitCount: this.submitCount,
+                    sessionDuration: Date.now() - this.sessionStartTime,
+                    isRunning: false // Not running until explicitly started
+                });
+            }
+        } catch (error) {
+            this.log(`❌ Error restoring session: ${error.message}`, 'error');
         }
     }
 
@@ -77,6 +123,16 @@ class QuickFillFormsV2 {
                         this.log('❌ No form data provided', 'error');
                         sendResponse({ success: false, message: 'No form data provided' });
                         break;
+                    }
+                    
+                    // Initialize session start time and save to storage
+                    if (!this.sessionStartTime) {
+                        this.sessionStartTime = Date.now();
+                        this.isRunning = true; // Mark as running when starting
+                        console.log(`🎯 Starting new session at: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+                        await this.saveSessionToStorage();
+                    } else {
+                        console.log(`🔄 Continuing existing session from: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
                     }
                     
                     this.currentFormData = formData;
@@ -172,6 +228,12 @@ class QuickFillFormsV2 {
             
             this.log(`✅ Completed ${cycleCount} form filling cycles`);
             
+            // Mark session as completed in storage
+            await chrome.storage.local.set({
+                sessionActive: false,
+                finalSessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0
+            });
+
             // Send completion status to popup
             chrome.runtime.sendMessage({
                 type: 'status_update',
@@ -188,6 +250,12 @@ class QuickFillFormsV2 {
         } catch (error) {
             this.log(`❌ Form filling error: ${error.message}`, 'error');
             
+            // Mark session as completed with error in storage
+            await chrome.storage.local.set({
+                sessionActive: false,
+                finalSessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0
+            });
+
             // Send error status to popup
             chrome.runtime.sendMessage({
                 type: 'status_update',
@@ -201,6 +269,8 @@ class QuickFillFormsV2 {
             return { success: false, message: error.message };
         } finally {
             this.isRunning = false;
+            // Save final state
+            await this.saveSessionToStorage();
         }
     }
 

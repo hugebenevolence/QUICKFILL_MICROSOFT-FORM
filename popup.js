@@ -19,8 +19,9 @@ class PopupController {
         this.setupEventListeners();
         this.setupStatusListener();
         await this.loadSettings();
+        this.initializeStatistics(); // Initialize first
+        await this.restoreSession(); // Then restore session to override defaults
         this.updateUI();
-        this.initializeStatistics();
     }
 
     setupEventListeners() {
@@ -613,7 +614,16 @@ class PopupController {
                     this.stopSession();
                 } else if (message.data.isRunning === true && !this.currentStats.isRunning) {
                     // Extension started, begin session
+                    console.log('🎯 Starting session from content script message');
                     this.startSession();
+                }
+                
+                // Sync session start time if we don't have it but content script is running
+                if (message.data.sessionStartTime && !this.sessionStartTime) {
+                    console.log('🔄 Syncing session start time from content script');
+                    this.sessionStartTime = message.data.sessionStartTime;
+                    this.currentStats.sessionDuration = Date.now() - this.sessionStartTime;
+                    this.startRealTimeUpdates();
                 }
             } else if (message.type === 'status_update') {
                 console.log('📋 Received completion status:', message.data);
@@ -641,21 +651,22 @@ class PopupController {
     }
 
     initializeStatistics() {
+        console.log('🎯 Initializing statistics section');
+        
         // Show statistics section if it exists
         const statsElement = document.getElementById('statistics');
         if (statsElement) {
             statsElement.style.display = 'block';
         }
         
-        // Initialize with default values
-        this.updateStatistics({
+        // Initialize with default values (will be overridden by restoreSession if data exists)
+        this.currentStats = {
             submitCount: 0,
             sessionDuration: 0,
             isRunning: false
-        });
+        };
         
-        // Start real-time updates
-        this.startRealTimeUpdates();
+        console.log('📊 Statistics initialized with defaults');
     }
 
     updateStatistics(data) {
@@ -814,10 +825,17 @@ class PopupController {
         }
     }
 
-    startSession() {
+    async startSession() {
         this.sessionStartTime = Date.now();
         this.currentStats.isRunning = true;
         this.currentStats.sessionDuration = 0;
+        
+        // Save session start time to storage for persistence
+        await chrome.storage.local.set({
+            sessionStartTime: this.sessionStartTime,
+            sessionActive: true,
+            submitCount: this.currentStats.submitCount
+        });
         
         this.updateStatistics(this.currentStats);
         this.startRealTimeUpdates();
@@ -831,9 +849,16 @@ class PopupController {
         console.log('🚀 Session started - real-time tracking enabled');
     }
 
-    stopSession() {
+    async stopSession() {
         this.currentStats.isRunning = false;
         this.updateStatistics(this.currentStats);
+        
+        // Save final session state to storage
+        await chrome.storage.local.set({
+            sessionActive: false,
+            finalSessionDuration: this.currentStats.sessionDuration,
+            submitCount: this.currentStats.submitCount
+        });
         
         // Keep real-time updates running to show final time
         // but stop after 10 seconds of inactivity
@@ -844,6 +869,70 @@ class PopupController {
         }, 10000);
         
         console.log('⏹️ Session stopped - statistics preserved');
+    }
+
+    async restoreSession() {
+        try {
+            console.log('🔄 Starting session restore...');
+            const sessionData = await chrome.storage.local.get([
+                'sessionStartTime', 'sessionActive', 'submitCount', 'finalSessionDuration'
+            ]);
+
+            console.log('� Raw session data from storage:', sessionData);
+
+            if (sessionData.sessionActive && sessionData.sessionStartTime) {
+                // Session is still active, restore with real-time calculation
+                this.sessionStartTime = sessionData.sessionStartTime;
+                this.currentStats.isRunning = false; // Don't assume it's running, wait for content script
+                this.currentStats.submitCount = sessionData.submitCount || 0;
+                
+                // Calculate current duration from start time
+                const currentDuration = Date.now() - this.sessionStartTime;
+                this.currentStats.sessionDuration = currentDuration;
+                
+                console.log(`📊 Restored active session:`);
+                console.log(`   - Start time: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+                console.log(`   - Current duration: ${Math.floor(currentDuration / 1000)}s`);
+                console.log(`   - Submit count: ${this.currentStats.submitCount}`);
+                console.log(`   - Session active: ${sessionData.sessionActive}`);
+                
+                // Start real-time updates for active sessions
+                this.startRealTimeUpdates();
+                
+                // Show statistics
+                const statsElement = document.getElementById('statistics');
+                if (statsElement) {
+                    statsElement.style.display = 'block';
+                    console.log('✅ Statistics section shown');
+                }
+                
+            } else if (sessionData.finalSessionDuration !== undefined || sessionData.submitCount > 0) {
+                // Session ended, show final stats
+                this.currentStats.isRunning = false;
+                this.currentStats.sessionDuration = sessionData.finalSessionDuration || 0;
+                this.currentStats.submitCount = sessionData.submitCount || 0;
+                
+                console.log(`📋 Restored completed session:`);
+                console.log(`   - Final duration: ${Math.floor(this.currentStats.sessionDuration / 1000)}s`);
+                console.log(`   - Final submit count: ${this.currentStats.submitCount}`);
+                
+                // Show statistics with final values
+                const statsElement = document.getElementById('statistics');
+                if (statsElement) {
+                    statsElement.style.display = 'block';
+                    console.log('✅ Statistics section shown for completed session');
+                }
+            } else {
+                console.log('ℹ️ No session data to restore');
+            }
+
+            // Update the UI with restored data
+            console.log('🎨 Updating UI with restored stats:', this.currentStats);
+            this.updateStatistics(this.currentStats);
+
+        } catch (error) {
+            console.error('❌ Error restoring session:', error);
+        }
     }
 
     // Weight dropdown management
