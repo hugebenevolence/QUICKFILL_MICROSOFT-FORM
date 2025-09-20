@@ -244,8 +244,9 @@ class PopupController {
             // Get current settings
             const settings = await chrome.storage.sync.get();
             
-            // Update UI state
+            // Update UI state and start session tracking
             this.isRunning = true;
+            this.startSession();
             this.updateUI();
             this.showStatus('Đang bắt đầu điền form...', 'info');
 
@@ -317,6 +318,7 @@ class PopupController {
             
             chrome.tabs.sendMessage(tab.id, { action: 'stopFilling' }, (response) => {
                 this.isRunning = false;
+                this.stopSession();
                 this.updateUI();
                 this.showStatus('Đã dừng điền form', 'info');
             });
@@ -324,6 +326,7 @@ class PopupController {
         } catch (error) {
             console.error('Error stopping form filling:', error);
             this.isRunning = false;
+            this.stopSession();
             this.updateUI();
         }
     }
@@ -575,7 +578,17 @@ class PopupController {
         // Listen for status updates from content script
         chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (message.action === 'statusUpdate') {
+                console.log('📊 Received status update:', message.data);
                 this.updateStatistics(message.data);
+                
+                // Handle session state changes
+                if (message.data.isRunning === false && this.currentStats.isRunning) {
+                    // Extension stopped, update session
+                    this.stopSession();
+                } else if (message.data.isRunning === true && !this.currentStats.isRunning) {
+                    // Extension started, begin session
+                    this.startSession();
+                }
             }
         });
     }
@@ -599,52 +612,191 @@ class PopupController {
     }
 
     updateStatistics(data) {
-        // Update submit count
+        // Merge with current stats
+        if (data.submitCount !== undefined) {
+            this.currentStats.submitCount = data.submitCount;
+        }
+        if (data.sessionDuration !== undefined) {
+            this.currentStats.sessionDuration = data.sessionDuration;
+        }
+        if (data.isRunning !== undefined) {
+            this.currentStats.isRunning = data.isRunning;
+        }
+        
+        // Set session start time when starting
+        if (data.isRunning && !this.sessionStartTime) {
+            this.sessionStartTime = Date.now();
+            this.startRealTimeUpdates();
+        }
+        
+        // Update submit count with animation
         const submitCountElement = document.getElementById('submitCount');
         if (submitCountElement && data.submitCount !== undefined) {
+            const oldCount = parseInt(submitCountElement.textContent) || 0;
             submitCountElement.textContent = data.submitCount;
             submitCountElement.style.color = data.submitCount > 0 ? '#38a169' : '#718096';
-        }
-
-        // Update session duration
-        const durationElement = document.getElementById('sessionDuration');
-        if (durationElement && data.sessionDuration !== undefined) {
-            const minutes = Math.floor(data.sessionDuration / 60000);
-            const seconds = Math.floor((data.sessionDuration % 60000) / 1000);
-            durationElement.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-        }
-
-        // Update running status
-        const statusElement = document.getElementById('runningStatus');
-        if (statusElement && data.isRunning !== undefined) {
-            if (data.isRunning) {
-                statusElement.textContent = 'Đang chạy';
-                statusElement.className = 'stat-value status-running';
-            } else {
-                statusElement.textContent = data.submitCount > 0 ? 'Hoàn thành' : 'Đang chờ';
-                statusElement.className = 'stat-value status-idle';
+            
+            // Add celebration animation for new submissions
+            if (data.submitCount > oldCount) {
+                submitCountElement.style.transform = 'scale(1.3)';
+                submitCountElement.style.fontWeight = 'bold';
+                setTimeout(() => {
+                    submitCountElement.style.transform = 'scale(1)';
+                    submitCountElement.style.fontWeight = '600';
+                }, 500);
             }
         }
 
-        // Show statistics section
+        // Update session duration (real-time updates handle this mostly)
+        if (data.sessionDuration !== undefined) {
+            this.updateDurationDisplay(data.sessionDuration);
+        }
+
+        // Update running status with smooth transitions
+        const statusElement = document.getElementById('runningStatus');
+        if (statusElement && data.isRunning !== undefined) {
+            let statusText, statusClass;
+            
+            if (data.isRunning) {
+                statusText = 'Đang chạy';
+                statusClass = 'stat-value status-running';
+            } else if (data.submitCount > 0) {
+                statusText = 'Hoàn thành';
+                statusClass = 'stat-value status-idle';
+            } else {
+                statusText = 'Đang chờ';
+                statusClass = 'stat-value status-idle';
+            }
+            
+            // Only update if different
+            if (statusElement.textContent !== statusText) {
+                statusElement.style.opacity = '0.5';
+                setTimeout(() => {
+                    statusElement.textContent = statusText;
+                    statusElement.className = statusClass;
+                    statusElement.style.opacity = '1';
+                }, 150);
+            }
+        }
+
+        // Show statistics section with fade-in effect
         const statsElement = document.getElementById('statistics');
         if (statsElement && (data.submitCount > 0 || data.isRunning)) {
-            statsElement.style.display = 'block';
+            if (statsElement.style.display === 'none') {
+                statsElement.style.opacity = '0';
+                statsElement.style.display = 'block';
+                setTimeout(() => {
+                    statsElement.style.opacity = '1';
+                }, 50);
+            }
         }
     }
 
     resetStatistics() {
-        this.updateStatistics({
+        this.sessionStartTime = null;
+        this.currentStats = {
             submitCount: 0,
             sessionDuration: 0,
             isRunning: false
-        });
+        };
+        
+        this.updateStatistics(this.currentStats);
         
         // Hide statistics if no activity
         const statsElement = document.getElementById('statistics');
         if (statsElement) {
             statsElement.style.display = 'none';
         }
+        
+        // Stop real-time updates
+        this.stopRealTimeUpdates();
+    }
+
+    startRealTimeUpdates() {
+        // Clear existing interval
+        if (this.statsUpdateInterval) {
+            clearInterval(this.statsUpdateInterval);
+        }
+        
+        // Update statistics every second
+        this.statsUpdateInterval = setInterval(() => {
+            this.updateRealTimeStats();
+        }, 1000);
+        
+        console.log('📊 Started real-time statistics updates');
+    }
+
+    stopRealTimeUpdates() {
+        if (this.statsUpdateInterval) {
+            clearInterval(this.statsUpdateInterval);
+            this.statsUpdateInterval = null;
+            console.log('📊 Stopped real-time statistics updates');
+        }
+    }
+
+    updateRealTimeStats() {
+        // Only update if session is active
+        if (this.sessionStartTime && (this.currentStats.isRunning || this.currentStats.submitCount > 0)) {
+            const currentDuration = Date.now() - this.sessionStartTime;
+            
+            // Update duration in real-time
+            this.currentStats.sessionDuration = currentDuration;
+            
+            // Update the duration display only (don't trigger full statistics update)
+            this.updateDurationDisplay(currentDuration);
+        }
+    }
+
+    updateDurationDisplay(duration) {
+        const durationElement = document.getElementById('sessionDuration');
+        if (durationElement) {
+            const minutes = Math.floor(duration / 60000);
+            const seconds = Math.floor((duration % 60000) / 1000);
+            const formattedTime = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            
+            // Only update if different to avoid unnecessary DOM manipulation
+            if (durationElement.textContent !== formattedTime) {
+                durationElement.textContent = formattedTime;
+                
+                // Add subtle animation for live feel
+                durationElement.style.transform = 'scale(1.05)';
+                setTimeout(() => {
+                    durationElement.style.transform = 'scale(1)';
+                }, 150);
+            }
+        }
+    }
+
+    startSession() {
+        this.sessionStartTime = Date.now();
+        this.currentStats.isRunning = true;
+        this.currentStats.sessionDuration = 0;
+        
+        this.updateStatistics(this.currentStats);
+        this.startRealTimeUpdates();
+        
+        // Show statistics section
+        const statsElement = document.getElementById('statistics');
+        if (statsElement) {
+            statsElement.style.display = 'block';
+        }
+        
+        console.log('🚀 Session started - real-time tracking enabled');
+    }
+
+    stopSession() {
+        this.currentStats.isRunning = false;
+        this.updateStatistics(this.currentStats);
+        
+        // Keep real-time updates running to show final time
+        // but stop after 10 seconds of inactivity
+        setTimeout(() => {
+            if (!this.currentStats.isRunning) {
+                this.stopRealTimeUpdates();
+            }
+        }, 10000);
+        
+        console.log('⏹️ Session stopped - statistics preserved');
     }
 }
 
@@ -677,6 +829,13 @@ function removeQuestion(button) {
 // Initialize popup when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
     window.popupController = new PopupController();
+});
+
+// Cleanup when popup is closed
+window.addEventListener('beforeunload', () => {
+    if (window.popupController) {
+        window.popupController.stopRealTimeUpdates();
+    }
 });
 
 // Listen for messages from content script
