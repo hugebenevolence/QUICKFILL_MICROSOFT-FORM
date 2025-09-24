@@ -1,0 +1,4355 @@
+// Prevent multiple injections
+if (typeof window.quickFillFormsV2Instance !== 'undefined') {
+    console.log('⚠️ QuickFill instance already exists, skipping initialization');
+} else {
+
+// QuickFill Microsoft Forms v2.1 - Enhanced Content Script
+console.log('🚀 QuickFill Microsoft Forms v2.1 loaded');
+
+class QuickFillFormsV2 {
+    constructor() {
+        this.isRunning = false;
+        this.debug = true;
+        this.delay = (min, max) => new Promise(resolve => setTimeout(resolve, Math.random() * (max - min) + min));
+        this.sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        this.currentFormData = {};
+        this.processedQuestions = new Set(); // Track processed questions per page
+        this.submitCount = 0; // Counter for submitted forms
+        this.sessionStartTime = null; // Will be set when starting
+        this.setupMessageListener();
+        this.restoreSession(); // Restore session if exists
+        this.log('🎯 QuickFill v2.1 initialized');
+    }
+
+    log(message, type = 'info') {
+        if (!this.debug) return;
+        const timestamp = new Date().toLocaleTimeString();
+        const prefix = type === 'error' ? '❌' : type === 'warning' ? '⚠️' : type === 'success' ? '✅' : '🔍';
+        console.log(`${prefix} [${timestamp}] QuickFill: ${message}`);
+    }
+
+    updateSubmitCount(increment = true) {
+        if (increment) {
+            this.submitCount++;
+            this.log(`📊 Form submitted! Total: ${this.submitCount}`, 'success');
+        }
+        
+        // Save updated count to storage
+        this.saveSessionToStorage();
+        
+        // Send update to popup
+        this.sendStatusUpdate({
+            submitCount: this.submitCount,
+            sessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0,
+            sessionStartTime: this.sessionStartTime,
+            isRunning: this.isRunning
+        });
+    }
+
+    sendStatusUpdate(status) {
+        try {
+            chrome.runtime.sendMessage({
+                action: 'statusUpdate',
+                data: status
+            }).catch(error => {
+                // Popup might be closed, ignore error
+                this.log(`Status update failed (popup likely closed): ${error.message}`);
+            });
+        } catch (error) {
+            this.log(`Error sending status update: ${error.message}`);
+        }
+    }
+
+    async saveSessionToStorage() {
+        try {
+            const sessionData = {
+                sessionStartTime: this.sessionStartTime,
+                sessionActive: this.isRunning,
+                submitCount: this.submitCount
+            };
+            
+            await chrome.storage.local.set(sessionData);
+            console.log(`💾 Session data saved to storage:`, sessionData);
+            console.log(`   - Start time: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+            console.log(`   - Active: ${this.isRunning}`);
+            console.log(`   - Submit count: ${this.submitCount}`);
+        } catch (error) {
+            console.error(`❌ Error saving session data: ${error.message}`);
+        }
+    }
+
+    async restoreSession() {
+        try {
+            const sessionData = await chrome.storage.local.get([
+                'sessionStartTime', 'sessionActive', 'submitCount'
+            ]);
+
+            if (sessionData.sessionActive && sessionData.sessionStartTime) {
+                this.sessionStartTime = sessionData.sessionStartTime;
+                this.submitCount = sessionData.submitCount || 0;
+                this.log(`🔄 Restored session: start=${this.sessionStartTime}, count=${this.submitCount}`);
+                
+                // Send restored state to popup
+                this.sendStatusUpdate({
+                    submitCount: this.submitCount,
+                    sessionDuration: Date.now() - this.sessionStartTime,
+                    isRunning: false // Not running until explicitly started
+                });
+            }
+        } catch (error) {
+            this.log(`❌ Error restoring session: ${error.message}`, 'error');
+        }
+    }
+
+    setupMessageListener() {
+        chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+            this.handleMessage(request, sender, sendResponse);
+            return true; // Keep message channel open for async response
+        });
+    }
+
+    async handleMessage(request, sender, sendResponse) {
+        try {
+            this.log(`📨 Received message: ${request.action}`);
+            this.log(`📋 Message data: ${JSON.stringify(request.data)}`);
+            
+            switch (request.action) {
+                case 'fillForm':
+                case 'startFilling':
+                    // Handle both action names for compatibility
+                    const formData = request.data || request.settings;
+                    
+                    if (!formData) {
+                        this.log('❌ No form data provided', 'error');
+                        sendResponse({ success: false, message: 'No form data provided' });
+                        break;
+                    }
+                    
+                    // Initialize session start time and save to storage
+                    if (!this.sessionStartTime) {
+                        this.sessionStartTime = Date.now();
+                        this.isRunning = true; // Mark as running when starting
+                        console.log(`🎯 Starting new session at: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+                        await this.saveSessionToStorage();
+                    } else {
+                        console.log(`🔄 Continuing existing session from: ${new Date(this.sessionStartTime).toLocaleTimeString()}`);
+                    }
+                    
+                    this.currentFormData = formData;
+                    
+                    // Map autoSubmitAnother to autoSubmit for backward compatibility
+                    if (this.currentFormData.autoSubmitAnother !== undefined) {
+                        this.currentFormData.autoSubmit = this.currentFormData.autoSubmitAnother;
+                    }
+                    
+                    this.log(`🎯 Starting form fill with data: ${JSON.stringify(this.currentFormData)}`);
+                    
+                    // Debug rating settings
+                    this.log(`🎯 Rating settings - Min: ${this.currentFormData.ratingMin}, Max: ${this.currentFormData.ratingMax}`);
+                    
+                    const result = await this.startFilling();
+                    this.log(`📊 Fill result: ${JSON.stringify(result)}`);
+                    sendResponse({ success: result.success, message: result.message });
+                    break;
+                
+                case 'stopFilling':
+                    this.isRunning = false;
+                    this.log('🛑 Form filling stopped by user');
+                    sendResponse({ success: true, message: 'Filling stopped' });
+                    break;
+                
+                case 'ping':
+                    sendResponse({ success: true, message: 'Content script is active' });
+                    break;
+                
+                default:
+                    sendResponse({ success: false, message: 'Unknown action' });
+            }
+        } catch (error) {
+            this.log(`Error handling message: ${error.message}`, 'error');
+            sendResponse({ success: false, message: error.message });
+        }
+    }
+
+    async startFilling() {
+        if (this.isRunning) {
+            this.log('⚠️ Form filling already in progress', 'warning');
+            return { success: false, message: 'Already running' };
+        }
+
+        try {
+            this.isRunning = true;
+            this.log('🚀 Starting form filling process...');
+            this.log(`📋 Form data received: ${JSON.stringify(this.currentFormData)}`);
+            
+            // Validate we're on a Microsoft Forms page
+            const isValid = this.isValidFormsPage();
+            this.log(`🔍 Page validation result: ${isValid}`);
+            
+            if (!isValid) {
+                throw new Error('Not a valid Microsoft Forms page. Current URL: ' + window.location.href);
+            }
+
+            let cycleCount = 0;
+            // Handle different property names from popup settings
+            const maxCycles = this.currentFormData.repeatCount || 
+                            this.currentFormData.maxFormSubmissions;
+            
+            this.log(`🎯 Max cycles configured: ${maxCycles} (repeatCount=${this.currentFormData.repeatCount}, maxFormSubmissions=${this.currentFormData.maxFormSubmissions})`);
+            
+            // If maxFormSubmissions is 0 or undefined, it means unlimited, so set a reasonable limit
+            const effectiveMaxCycles = (maxCycles === 0 || maxCycles === undefined) ? Number.MAX_SAFE_INTEGER : maxCycles;
+            
+            while (cycleCount < effectiveMaxCycles && this.isRunning) {
+                this.log(`🔄 Starting fill cycle ${cycleCount + 1}/${effectiveMaxCycles}`);
+                
+                try {
+                    const fillResult = await this.fillCurrentForm();
+                    if (!fillResult) {
+                        throw new Error('Form filling failed');
+                    }
+                    
+                    cycleCount++;
+                    
+                    // If this is not the last cycle, try to submit another response
+                    if (cycleCount < effectiveMaxCycles && this.currentFormData.autoSubmit) {
+                        this.log('🔄 Attempting to submit another response...');
+                        const submitAnotherResult = await this.clickSubmitAnother();
+                        
+                        if (!submitAnotherResult) {
+                            this.log('⚠️ Could not click "Submit another response", stopping cycles');
+                            break;
+                        }
+                        
+                        // Wait for new form to load after clicking submit another
+                        this.log('⏳ Waiting for new form to load...');
+                        await this.waitForFormToLoad();
+                    }
+                } catch (fillError) {
+                    this.log(`❌ Error in fill cycle ${cycleCount + 1}: ${fillError.message}`, 'error');
+                    
+                    // Decide whether to continue or break based on error severity
+                    if (fillError.message.includes('Not a valid Microsoft Forms page') || 
+                        fillError.message.includes('No questions found')) {
+                        throw fillError; // Critical error, stop completely
+                    }
+                    
+                    // Non-critical error, continue with next cycle but log it
+                    this.log('🔄 Continuing to next cycle despite error', 'warning');
+                }
+            }
+            
+            this.log(`✅ Completed ${cycleCount} form filling cycles`);
+            
+            // Mark session as completed in storage
+            await chrome.storage.local.set({
+                sessionActive: false,
+                finalSessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0
+            });
+
+            // Send completion status to popup
+            chrome.runtime.sendMessage({
+                type: 'status_update',
+                data: {
+                    type: 'success',
+                    message: `✅ Hoàn thành! Đã điền ${cycleCount} form thành công`,
+                    isCompleted: true,
+                    cycleCount: cycleCount
+                }
+            }).catch(err => console.log('Popup closed'));
+            
+            return { success: true, message: `Completed ${cycleCount} cycles successfully` };
+            
+        } catch (error) {
+            this.log(`❌ Form filling error: ${error.message}`, 'error');
+            
+            // Mark session as completed with error in storage
+            await chrome.storage.local.set({
+                sessionActive: false,
+                finalSessionDuration: this.sessionStartTime ? Date.now() - this.sessionStartTime : 0
+            });
+
+            // Send error status to popup
+            chrome.runtime.sendMessage({
+                type: 'status_update',
+                data: {
+                    type: 'error',
+                    message: `❌ Lỗi: ${error.message}`,
+                    isCompleted: true
+                }
+            }).catch(err => console.log('Popup closed'));
+            
+            return { success: false, message: error.message };
+        } finally {
+            this.isRunning = false;
+            // Save final state
+            try {
+                await this.saveSessionToStorage();
+            } catch (saveError) {
+                this.log(`❌ Error saving final session: ${saveError.message}`, 'error');
+            }
+        }
+    }
+
+    isValidFormsPage() {
+        const validDomains = [
+            'forms.office.com',
+            'forms.microsoft.com',
+            'forms.office365.com',
+            'forms.cloud.microsoft'
+        ];
+        
+        const currentDomain = window.location.hostname;
+        const isValid = validDomains.some(domain => currentDomain.includes(domain));
+        
+        this.log(`🔍 Page validation: ${currentDomain} - ${isValid ? 'Valid' : 'Invalid'}`);
+        return isValid;
+    }
+
+    async fillCurrentForm() {
+        try {
+            this.log('📝 Starting form fill process...');
+            this.log(`🌐 Current URL: ${window.location.href}`);
+            this.log(`📄 Document ready state: ${document.readyState}`);
+            
+            // Wait for form to be fully loaded
+            this.log('⏳ Waiting for form to load...');
+            await this.waitForFormLoad();
+            
+            // Get all questions with validation
+            this.log('🔍 Searching for questions...');
+            let questions;
+            try {
+                questions = await this.getAllQuestions();
+            } catch (questionError) {
+                this.log(`❌ Error getting questions: ${questionError.message}`, 'error');
+                throw new Error(`Failed to detect form questions: ${questionError.message}`);
+            }
+            
+            this.log(`📋 Found ${questions.length} questions to process`);
+            
+            if (questions.length === 0) {
+                this.log('❌ No questions found. Analyzing page structure...', 'error');
+                this.logPageStructure();
+                throw new Error('No questions found on the form. Check if the page has loaded correctly.');
+            }
+            
+            // Fill each question with error handling
+            for (let i = 0; i < questions.length; i++) {
+                if (!this.isRunning) break;
+                
+                const question = questions[i];
+                this.log(`📝 Processing question ${i + 1}/${questions.length}: ${question.type}`);
+                
+                try {
+                    await this.fillQuestion(question);
+                    await this.delay(300, 800); // Random delay between questions
+                } catch (questionError) {
+                    this.log(`❌ Error filling question ${i + 1}: ${questionError.message}`, 'error');
+                    // Continue with other questions instead of failing completely
+                    continue;
+                }
+            }
+            
+            // After filling all questions on current page, check for navigation
+            this.log('🔍 All questions filled, checking for navigation options...');
+            const navigationResult = await this.proceedToNext();
+            
+            if (navigationResult.success) {
+                if (navigationResult.type === 'next') {
+                    this.log('📄 Successfully navigated to next page');
+                    
+                    // Reset state for new page
+                    await this.resetPageState();
+                    
+                    // Continue filling on new page (recursive call)
+                    this.log('🔄 Continuing form fill on new page...');
+                    return await this.fillCurrentForm();
+                    
+                } else if (navigationResult.type === 'submit') {
+                    this.log('🎉 Form submitted successfully');
+                    return true;
+                }
+            } else {
+                // No navigation buttons found - try manual submit if auto-submit enabled
+                if (this.currentFormData.autoSubmit) {
+                    this.log('📤 No navigation buttons found, attempting manual submit...');
+                    
+                    // Enhanced comprehensive validation check before submit
+                    await this.sleep(1000); // Give form time to update and process
+                    
+                    let validationResult;
+                    try {
+                        validationResult = this.performComprehensiveValidation();
+                    } catch (validationError) {
+                        this.log(`❌ Validation check failed: ${validationError.message}`, 'error');
+                        // Continue with submit attempt
+                        validationResult = { isValid: true, errors: [], warnings: [] };
+                    }
+                    
+                    if (!validationResult.isValid) {
+                        this.log(`⚠️ Form validation issues detected (${validationResult.errors.length} issues):`, 'warning');
+                        validationResult.errors.forEach(error => this.log(`  • ${error}`, 'warning'));
+                        
+                        // Check if errors are critical or can be ignored
+                        const criticalErrors = validationResult.errors.filter(error => 
+                            error.toLowerCase().includes('required') || 
+                            error.toLowerCase().includes('mandatory') ||
+                            error.toLowerCase().includes('must')
+                        );
+                        
+                        if (criticalErrors.length > 0) {
+                            this.log(`❌ Critical validation errors found, cannot submit:`, 'error');
+                            criticalErrors.forEach(error => this.log(`  • ${error}`, 'error'));
+                            throw new Error(`Critical validation errors: ${criticalErrors.join(', ')}`);
+                        } else {
+                            this.log('🔄 Non-critical validation issues, proceeding with submit');
+                        }
+                    } else {
+                        this.log(`✅ Form validation passed: ${validationResult.successMessage}`, 'success');
+                    }
+                    
+                    try {
+                        await this.submitForm();
+                        return true;
+                    } catch (submitError) {
+                        this.log(`⚠️ Manual submit failed: ${submitError.message}`, 'warning');
+                        this.log('ℹ️ Form may be complete or require manual intervention');
+                        return true; // Consider it successful since questions were filled
+                    }
+                } else {
+                    this.log('ℹ️ Auto-submit disabled, form filling complete');
+                    return true;
+                }
+            }
+            
+            return true;
+            
+        } catch (error) {
+            this.log(`❌ Error in form filling loop: ${error.message}`, 'error');
+            throw error;
+        }
+    }
+
+    async waitForFormLoad() {
+        this.log('⏳ Waiting for form to load...');
+        
+        let attempts = 0;
+        const maxAttempts = 30; // 15 seconds max wait
+        
+        while (attempts < maxAttempts) {
+            const questions = document.querySelectorAll('[role="radiogroup"], [data-automation-id="questionItem"], input[type="radio"], input[type="checkbox"]');
+            
+            this.log(`🔄 Attempt ${attempts + 1}/${maxAttempts}: Found ${questions.length} form elements`);
+            
+            if (questions.length > 0) {
+                this.log(`✅ Form loaded with ${questions.length} interactive elements`);
+                await this.sleep(1000); // Extra wait for full rendering
+                return;
+            }
+            
+            // Check if page is still loading
+            if (document.readyState !== 'complete') {
+                this.log(`📄 Document still loading... (${document.readyState})`);
+            }
+            
+            await this.sleep(500);
+            attempts++;
+        }
+        
+        this.log('⚠️ Form load timeout - analyzing current page state', 'warning');
+        this.logPageStructure();
+    }
+
+    async getAllQuestions() {
+        this.log('🔍 SMART question detection starting...');
+        
+        // Clear processed questions if user manually triggered restart
+        if (this.shouldResetProcessedQuestions()) {
+            this.log('🔄 Resetting processed questions for fresh start...');
+            this.processedQuestions.clear();
+        }
+        
+        // Use primary strategy first - most reliable
+        let allQuestions = this.detectStandardQuestions();
+        
+        // Only use fallback strategies if primary doesn't find enough
+        if (allQuestions.length === 0) {
+            this.log('⚠️ No standard questions found, trying fallback strategies...');
+            allQuestions = this.detectFallbackQuestions();
+        }
+        
+        // Remove duplicates and invalid questions
+        allQuestions = this.cleanAndValidateQuestions(allQuestions);
+        
+        // Sort by priority and DOM position
+        allQuestions = this.sortQuestionsByPriority(allQuestions);
+        
+        // Filter out processed questions (but allow re-detection if needed)
+        const unprocessedQuestions = this.filterUnprocessedQuestions(allQuestions);
+        
+        this.log(`📊 FINAL: ${allQuestions.length} total questions, ${unprocessedQuestions.length} ready to process`);
+        
+        return unprocessedQuestions;
+    }
+
+    shouldResetProcessedQuestions() {
+        // Reset if this is a fresh manual trigger (not from page navigation)
+        const now = Date.now();
+        const timeSinceLastReset = now - (this.lastResetTime || 0);
+        
+        // Reset if it's been more than 30 seconds since last activity
+        // OR if user manually clicked the extension
+        if (timeSinceLastReset > 30000) {
+            this.lastResetTime = now;
+            return true;
+        }
+        
+        return false;
+    }
+
+    detectStandardQuestions() {
+        const questions = [];
+        
+        // Primary strategy: Microsoft Forms standard question items
+        const questionItems = document.querySelectorAll('[data-automation-id="questionItem"]');
+        this.log(`📊 Primary detection: ${questionItems.length} standard question items`);
+        
+        for (const element of questionItems) {
+            if (!this.isQuestionElementReady(element)) continue;
+            
+            const questionType = this.identifyQuestionType(element);
+            if (questionType) {
+                const questionId = this.generateQuestionId(element);
+                
+                // Check for duplicates
+                if (!questions.some(q => q.id === questionId)) {
+                    questions.push({
+                        element: element,
+                        type: questionType,
+                        id: questionId,
+                        priority: this.getQuestionPriority(questionType, element),
+                        isRequired: this.isQuestionRequired(element),
+                        source: 'standard'
+                    });
+                    
+                    this.log(`✅ Standard question: ${questionType} (ID: ${questionId.substring(0, 12)}...)`);
+                }
+            }
+        }
+        
+        return questions;
+    }
+
+    detectFallbackQuestions() {
+        const questions = [];
+        
+        this.log('🔄 Using fallback detection strategies...');
+        
+        // Strategy 1: Radio groups that might be standalone
+        const radioGroups = document.querySelectorAll('[role="radiogroup"]');
+        this.log(`📊 Fallback 1: ${radioGroups.length} radio groups`);
+        
+        for (const element of radioGroups) {
+            // Skip if it's already inside a standard question item
+            if (element.closest('[data-automation-id="questionItem"]')) continue;
+            
+            if (this.isQuestionElementReady(element)) {
+                const questionId = this.generateQuestionId(element);
+                
+                if (!questions.some(q => q.id === questionId)) {
+                    questions.push({
+                        element: element,
+                        type: 'radio',
+                        id: questionId,
+                        priority: 2,
+                        isRequired: this.isQuestionRequired(element),
+                        source: 'radiogroup'
+                    });
+                    
+                    this.log(`✅ Fallback radio group: ${questionId.substring(0, 12)}...`);
+                }
+            }
+        }
+        
+        // Strategy 2: Matrix/Likert questions
+        const matrixQuestions = this.detectMatrixQuestions();
+        questions.push(...matrixQuestions);
+        
+        return questions;
+    }
+
+    detectMatrixQuestions() {
+        const matrixQuestions = [];
+        
+        // Look for Likert scale containers
+        const likertContainers = document.querySelectorAll('[data-automation-id*="likert"], [data-automation-id*="matrix"]');
+        
+        for (const container of likertContainers) {
+            // Skip if already processed or inside standard question
+            if (container.closest('[data-automation-id="questionItem"]')) continue;
+            
+            const radioInputs = container.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length >= 5) { // Likely a Likert scale
+                const questionId = this.generateQuestionId(container);
+                
+                if (!matrixQuestions.some(q => q.id === questionId)) {
+                    matrixQuestions.push({
+                        element: container,
+                        type: 'matrix',
+                        id: questionId,
+                        priority: 4,
+                        isRequired: this.isQuestionRequired(container),
+                        source: 'matrix'
+                    });
+                    
+                    this.log(`✅ Matrix question detected: ${questionId.substring(0, 12)}... (${radioInputs.length} inputs)`);
+                }
+            }
+        }
+        
+        return matrixQuestions;
+    }
+
+    cleanAndValidateQuestions(questions) {
+        // Remove duplicates based on element reference and ID
+        const cleanQuestions = [];
+        const seenElements = new Set();
+        const seenIds = new Set();
+        
+        for (const question of questions) {
+            // Skip if we've seen this element or ID
+            if (seenElements.has(question.element) || seenIds.has(question.id)) {
+                continue;
+            }
+            
+            // Validate question is still in DOM and ready
+            if (document.contains(question.element) && this.isQuestionElementReady(question.element)) {
+                cleanQuestions.push(question);
+                seenElements.add(question.element);
+                seenIds.add(question.id);
+            }
+        }
+        
+        this.log(`🧹 Cleaned questions: ${questions.length} → ${cleanQuestions.length} (removed ${questions.length - cleanQuestions.length} duplicates/invalid)`);
+        
+        return cleanQuestions;
+    }
+
+    sortQuestionsByPriority(questions) {
+        return questions.sort((a, b) => {
+            // First sort by required status
+            if (a.isRequired !== b.isRequired) {
+                return b.isRequired - a.isRequired;
+            }
+            
+            // Then by priority
+            if (a.priority !== b.priority) {
+                return b.priority - a.priority;
+            }
+            
+            // Finally by DOM position
+            const aRect = a.element.getBoundingClientRect();
+            const bRect = b.element.getBoundingClientRect();
+            
+            return aRect.top - bRect.top;
+        });
+    }
+
+    filterUnprocessedQuestions(allQuestions) {
+        const unprocessedQuestions = [];
+        
+        for (const question of allQuestions) {
+            const isProcessed = this.processedQuestions.has(question.id);
+            const isStillAnswered = this.isQuestionStillAnswered(question);
+            
+            if (isProcessed && isStillAnswered) {
+                // Question was processed and is still answered - skip
+                continue;
+            } else if (isProcessed && !isStillAnswered) {
+                // Question was processed but answer is gone - re-process
+                this.log(`� Re-processing question with lost answer: ${question.id}`);
+                this.processedQuestions.delete(question.id);
+                unprocessedQuestions.push(question);
+            } else {
+                // New unprocessed question
+                unprocessedQuestions.push(question);
+            }
+        }
+        
+        return unprocessedQuestions;
+    }
+
+    isQuestionStillAnswered(question) {
+        try {
+            return this.isQuestionAnswered(question.element);
+        } catch (error) {
+            // If we can't determine, assume it needs re-processing
+            return false;
+        }
+    }
+
+    findOrphanedFormControls() {
+        const orphanedControls = [];
+        
+        try {
+            // Look for form controls that might not be inside proper question containers  
+            const formControlSelectors = [
+                'input[type="radio"]',
+                'input[type="checkbox"]', 
+                'input[type="text"]',
+                'textarea',
+                'select',
+                '[role="slider"]'
+            ];
+            
+            formControlSelectors.forEach(selector => {
+                const controls = document.querySelectorAll(selector);
+                
+                for (const control of controls) {
+                    // Check if this control is already inside a detected question container
+                    const parentQuestion = control.closest(`
+                        [data-automation-id="questionItem"], 
+                        .office-form-question, 
+                        [data-automation-id="question"],
+                        [role="radiogroup"],
+                        .question-container
+                    `);
+                    
+                    if (!parentQuestion && this.isElementVisible(control)) {
+                        // This is an orphaned control, find or create appropriate container
+                        const wrapper = this.findOrCreateControlContainer(control);
+                        if (wrapper && !orphanedControls.includes(wrapper)) {
+                            orphanedControls.push(wrapper);
+                            this.log(`🔍 Found orphaned form control: ${control.type || control.tagName}`);
+                        }
+                    }
+                }
+            });
+        } catch (error) {
+            this.log(`❌ Error finding orphaned controls: ${error.message}`, 'error');
+        }
+        
+        return orphanedControls;
+    }
+
+    findOrCreateControlContainer(control) {
+        try {
+            // Try to find a logical container (like a parent div with question-like attributes)
+            let container = control.closest('div[aria-labelledby], div.form-group, fieldset');
+            
+            if (!container) {
+                // Look for a parent that contains question text
+                let parent = control.parentElement;
+                while (parent && parent !== document.body) {
+                    const text = parent.textContent?.trim();
+                    if (text && text.length > 10 && text.length < 500 && text.includes('?')) {
+                        container = parent;
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
+            }
+            
+            if (!container) {
+                // Last resort: create a synthetic container
+                container = document.createElement('div');
+                container.setAttribute('data-synthetic-question', 'true');
+                container.setAttribute('data-original-control', control.id || control.name || 'unnamed');
+                
+                // Insert container before the control
+                control.parentNode?.insertBefore(container, control);
+                container.appendChild(control);
+            }
+            
+            return container;
+        } catch (error) {
+            this.log(`❌ Error creating control container: ${error.message}`, 'error');
+            return null;
+        }
+    }
+
+    findTableBasedQuestions() {
+        const tableQuestions = [];
+        
+        try {
+            // Look for tables that contain form controls (Likert scales, matrices)
+            const tables = document.querySelectorAll('table, [role="table"], .table-container');
+            
+            for (const table of tables) {
+                const formControls = table.querySelectorAll('input[type="radio"], input[type="checkbox"], select');
+                
+                if (formControls.length > 0) {
+                    // This table contains form controls, treat it as a question
+                    const existingContainer = table.closest('[data-automation-id="questionItem"], .office-form-question');
+                    
+                    if (!existingContainer) {
+                        // This is a standalone table question
+                        tableQuestions.push(table);
+                        this.log(`🔍 Found table-based question: ${formControls.length} controls`);
+                    }
+                }
+            }
+        } catch (error) {
+            this.log(`❌ Error finding table questions: ${error.message}`, 'error');
+        }
+        
+        return tableQuestions;
+    }
+
+    isQuestionElementReady(element) {
+        try {
+            // Enhanced readiness check
+            if (!this.isElementVisible(element)) {
+                return false;
+            }
+            
+            // Check if question has interactive elements
+            const interactiveElements = element.querySelectorAll(`
+                input[type="radio"], 
+                input[type="checkbox"], 
+                input[type="text"], 
+                textarea, 
+                select,
+                [role="slider"]
+            `);
+            
+            if (interactiveElements.length === 0) {
+                return false;
+            }
+            
+            // Check if at least one interactive element is ready
+            const readyElements = Array.from(interactiveElements).filter(el => {
+                return !el.disabled && this.isElementVisible(el);
+            });
+            
+            return readyElements.length > 0;
+        } catch (error) {
+            this.log(`❌ Error checking question readiness: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    getQuestionPriority(questionType, element) {
+        // Assign priority based on question type and characteristics
+        const basePriority = {
+            'text': 1,      // Fill text fields first (they're simple)
+            'radio': 2,     // Then single-choice questions
+            'checkbox': 2,  // Multi-choice at same level
+            'select': 2,    // Dropdowns at same level
+            'rating': 3,    // Rating scales need special handling
+            'matrix': 4     // Matrix questions are most complex
+        };
+        
+        let priority = basePriority[questionType] || 1;
+        
+        // Boost priority for required questions
+        if (this.isQuestionRequired(element)) {
+            priority += 5;
+        }
+        
+        // Lower priority for questions with conditional logic (they might depend on other answers)
+        if (this.hasConditionalLogic(element)) {
+            priority -= 1;
+        }
+        
+        return priority;
+    }
+
+    isQuestionRequired(element) {
+        try {
+            // Check various indicators for required questions
+            const requiredIndicators = [
+                '[aria-required="true"]',
+                '.required',
+                '[data-required="true"]',
+                '[required]'
+            ];
+            
+            for (const indicator of requiredIndicators) {
+                if (element.querySelector(indicator) || element.matches(indicator)) {
+                    return true;
+                }
+            }
+            
+            // Check for asterisk in question text
+            const questionText = this.getQuestionText(element);
+            return questionText && questionText.includes('*');
+        } catch (error) {
+            return false;
+        }
+    }
+
+    hasConditionalLogic(element) {
+        try {
+            // Check if question has conditional display logic
+            const conditionalIndicators = [
+                '[data-conditional]',
+                '[data-depends-on]',
+                '.conditional-question',
+                '[data-condition]'
+            ];
+            
+            for (const indicator of conditionalIndicators) {
+                if (element.matches(indicator) || element.querySelector(indicator)) {
+                    return true;
+                }
+            }
+            
+            // Check if initially hidden (might be conditional)
+            const style = window.getComputedStyle(element);
+            return style.display === 'none' || style.visibility === 'hidden';
+        } catch (error) {
+            return false;
+        }
+    }
+
+    debugQuestionStructure(element) {
+        if (!this.debug) return;
+        
+        try {
+            this.log(`🔍 DEBUG: Question structure analysis`);
+            this.log(`   - Tag: ${element.tagName}`);
+            this.log(`   - Classes: ${element.className}`);
+            this.log(`   - ID: ${element.id}`);
+            
+            const dataAttrs = Array.from(element.attributes)
+                .filter(attr => attr.name.startsWith('data-'))
+                .map(attr => `${attr.name}="${attr.value}"`)
+                .join(', ');
+            this.log(`   - Data attributes: ${dataAttrs}`);
+            
+            const inputs = element.querySelectorAll('input, textarea, select');
+            this.log(`   - Input elements: ${inputs.length}`);
+            this.ensureArray(inputs).forEach((input, index) => {
+                this.log(`     ${index + 1}. ${input.tagName}[type="${input.type || 'N/A'}"] - ${input.name || input.id || 'unnamed'}`);
+            });
+            
+            const text = this.getQuestionText(element);
+            this.log(`   - Question text: "${text?.substring(0, 100)}..."`);
+            
+        } catch (error) {
+            this.log(`❌ Error debugging question structure: ${error.message}`, 'error');
+        }
+    }
+
+    generateQuestionId(element) {
+        // Generate stable, unique ID for question tracking
+        
+        // Method 1: Use element ID if available
+        if (element.id && element.id.trim()) {
+            return `id_${element.id}`;
+        }
+        
+        // Method 2: Use question text hash if available
+        const questionText = this.getQuestionText(element);
+        if (questionText && questionText.length > 5) {
+            const hash = this.createStableHash(questionText);
+            return `text_${hash}`;
+        }
+        
+        // Method 3: Use element attributes and structure
+        const attributeSignature = this.getElementSignature(element);
+        if (attributeSignature) {
+            const hash = this.createStableHash(attributeSignature);
+            return `attr_${hash}`;
+        }
+        
+        // Method 4: Use DOM position as last resort
+        const domPosition = this.getElementDOMPosition(element);
+        return `pos_${domPosition}`;
+    }
+
+    createStableHash(text) {
+        // Create a stable hash that's consistent across sessions
+        let hash = 0;
+        if (text.length === 0) return hash;
+        
+        for (let i = 0; i < text.length; i++) {
+            const char = text.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        
+        return Math.abs(hash).toString(36); // Base36 for shorter IDs
+    }
+
+    getElementSignature(element) {
+        // Create a unique signature from element attributes and structure
+        const parts = [];
+        
+        // Add tag name
+        parts.push(element.tagName.toLowerCase());
+        
+        // Add significant attributes
+        const significantAttrs = ['data-automation-id', 'class', 'role', 'aria-label', 'name'];
+        for (const attr of significantAttrs) {
+            const value = element.getAttribute(attr);
+            if (value) {
+                parts.push(`${attr}:${value.substring(0, 20)}`);
+            }
+        }
+        
+        // Add child element count and types
+        const childTypes = Array.from(element.children).map(child => child.tagName.toLowerCase());
+        const uniqueChildTypes = [...new Set(childTypes)].sort();
+        if (uniqueChildTypes.length > 0) {
+            parts.push(`children:${uniqueChildTypes.join(',')}`);
+        }
+        
+        // Add input count if it's a form element
+        const inputs = element.querySelectorAll('input, textarea, select');
+        if (inputs.length > 0) {
+            const inputTypes = Array.from(inputs).map(input => input.type || input.tagName.toLowerCase());
+            const uniqueInputTypes = [...new Set(inputTypes)].sort();
+            parts.push(`inputs:${inputs.length}:${uniqueInputTypes.join(',')}`);
+        }
+        
+        return parts.join('|');
+    }
+
+    getElementDOMPosition(element) {
+        // Get a stable position identifier based on DOM structure
+        let position = 0;
+        let current = element;
+        
+        // Walk up the tree and calculate position
+        while (current && current.parentElement) {
+            const siblings = Array.from(current.parentElement.children);
+            position += siblings.indexOf(current);
+            current = current.parentElement;
+            
+            // Limit depth to avoid huge numbers
+            if (position > 10000) break;
+        }
+        
+        // Add element rect for additional uniqueness
+        const rect = element.getBoundingClientRect();
+        const rectSignature = `${Math.round(rect.top)}_${Math.round(rect.left)}_${Math.round(rect.width)}_${Math.round(rect.height)}`;
+        
+        return `${position}_${rectSignature}`;
+    }
+
+    getElementXPath(element) {
+        // Simple XPath generation for element identification
+        const parts = [];
+        let current = element;
+        
+        while (current && current.nodeType === Node.ELEMENT_NODE) {
+            let selector = current.tagName.toLowerCase();
+            if (current.id) {
+                selector += `[@id="${current.id}"]`;
+                parts.unshift(selector);
+                break;
+            } else if (current.className) {
+                selector += `[@class="${current.className.replace(/\s+/g, ' ').trim()}"]`;
+            }
+            
+            // Add position if needed to make unique
+            const siblings = Array.from(current.parentNode?.children || []);
+            const sameTagSiblings = siblings.filter(sibling => sibling.tagName === current.tagName);
+            if (sameTagSiblings.length > 1) {
+                const index = sameTagSiblings.indexOf(current) + 1;
+                selector += `[${index}]`;
+            }
+            
+            parts.unshift(selector);
+            current = current.parentNode;
+            
+            // Limit depth to avoid overly long XPaths
+            if (parts.length > 5) break;
+        }
+        
+        return parts.join('/');
+    }
+
+    identifyQuestionType(element) {
+        // Matrix/Grid questions (Likert scale tables) - Be more precise to avoid false positives
+        
+        // Method 1: Check for Microsoft Forms specific Likert structure (most reliable) - Updated for new structure
+        const likertSubQuestions = element.querySelectorAll('[data-automation-id="likerSubQuestion"]');
+        if (likertSubQuestions.length > 0) {
+            this.log(`🔍 Matrix question detected via likerSubQuestion: ${likertSubQuestions.length} sub-questions`);
+            return 'matrix';
+        }
+        
+        // Method 1b: Legacy check for old Likert structure
+        const likertStatements = element.querySelectorAll('[data-automation-id="likerStatementTd"]');
+        if (likertStatements.length > 0) {
+            this.log(`🔍 Matrix question detected via likertStatements: ${likertStatements.length}`);
+            return 'matrix';
+        }
+        
+        // Method 2: Check for table with multiple radio group rows
+        const radioGroupRows = element.querySelectorAll('tr[role="radiogroup"]');
+        if (radioGroupRows.length > 1) {
+            this.log(`🔍 Matrix question detected via radioGroupRows: ${radioGroupRows.length}`);
+            return 'matrix';
+        }
+        
+        // Method 3: Check for table with many radio inputs arranged in rows
+        const tablesWithRadios = element.querySelectorAll('table');
+        for (const table of tablesWithRadios) {
+            const tableRows = table.querySelectorAll('tr');
+            const radioInputsInTable = table.querySelectorAll('input[type="radio"]');
+            
+            // Must have multiple rows AND multiple radios (at least 2 rows x 3 options = 6 radios minimum)
+            if (tableRows.length >= 2 && radioInputsInTable.length >= 6) {
+                // Additional check: radios should be distributed across rows
+                let rowsWithRadios = 0;
+                for (const row of tableRows) {
+                    if (row.querySelectorAll('input[type="radio"]').length > 0) {
+                        rowsWithRadios++;
+                    }
+                }
+                
+                if (rowsWithRadios >= 2) {
+                    this.log(`🔍 Matrix question detected via table structure: ${rowsWithRadios} rows with radios, ${radioInputsInTable.length} total radios`);
+                    return 'matrix';
+                }
+            }
+        }
+        
+        // Method 4: Check for multiple radio groups (non-table structure)
+        const radioGroups = element.querySelectorAll('[role="radiogroup"]');
+        if (radioGroups.length > 1) {
+            this.log(`🔍 Matrix question detected via multiple radiogroups: ${radioGroups.length}`);
+            return 'matrix';
+        }
+        
+        // Method 5: Fallback - check for very high radio count with specific patterns
+        const allRadioInputs = element.querySelectorAll('input[type="radio"]');
+        if (allRadioInputs.length >= 15) { // Very conservative threshold
+            // Additional verification: check if radios are grouped (same name attribute patterns)
+            const radioNames = new Set();
+            allRadioInputs.forEach(radio => {
+                if (radio.name) radioNames.add(radio.name);
+            });
+            
+            // If we have multiple radio groups (different names), it's likely a matrix
+            if (radioNames.size >= 3) {
+                this.log(`🔍 Matrix question detected via high radio count: ${allRadioInputs.length} radios, ${radioNames.size} groups`);
+                return 'matrix';
+            }
+        }
+        
+        // Rating/Likert scale (single row slider-style)
+        if (element.querySelector('[role="slider"], .rating-component')) {
+            return 'rating';
+        }
+        
+        // Dropdown
+        if (element.querySelector('select')) {
+            return 'select';
+        }
+        
+        // Text input
+        if (element.querySelector('input[type="text"], textarea')) {
+            return 'text';
+        }
+        
+        // Checkboxes
+        if (element.querySelector('input[type="checkbox"]')) {
+            return 'checkbox';
+        }
+        
+        // Multiple choice (radio buttons) - Check last as matrix also has radio buttons
+        if (element.querySelector('input[type="radio"]') || element.getAttribute('role') === 'radiogroup') {
+            return 'radio';
+        }
+        
+        return null;
+    }
+
+    async fillQuestion(question) {
+        try {
+            this.log(`🎯 Filling ${question.type} question (index: ${question.index})`);
+            
+            switch (question.type) {
+                case 'radio':
+                    await this.fillRadioQuestion(question);
+                    break;
+                case 'checkbox':
+                    await this.fillCheckboxQuestion(question);
+                    break;
+                case 'text':
+                    await this.fillTextQuestion(question);
+                    break;
+                case 'rating':
+                    await this.fillRatingQuestion(question);
+                    break;
+                case 'select':
+                    await this.fillSelectQuestion(question);
+                    break;
+                case 'matrix':
+                    await this.fillMatrixQuestion(question);
+                    break;
+                default:
+                    this.log(`⚠️ Unknown question type: ${question.type}`, 'warning');
+            }
+            
+            // Mark question as processed after successful fill
+            const questionId = this.generateQuestionId(question.element);
+            this.processedQuestions.add(questionId);
+            this.log(`✅ Question marked as processed: ${questionId}`);
+            
+            await this.delay(200, 500);
+            
+        } catch (error) {
+            this.log(`❌ Error filling question: ${error.message}`, 'error');
+            
+            // Still mark as processed to avoid infinite loops on problematic questions
+            const questionId = this.generateQuestionId(question.element);
+            this.processedQuestions.add(questionId);
+            this.log(`⚠️ Question marked as processed despite error: ${questionId}`);
+        }
+    }
+
+    async fillRadioQuestion(question) {
+        const radioInputs = question.element.querySelectorAll('input[type="radio"]');
+        
+        if (radioInputs.length === 0) {
+            this.log('⚠️ No radio inputs found', 'warning');
+            return;
+        }
+        
+        this.log(`📊 Found ${radioInputs.length} radio options`);
+        
+        // Get user preferences for this question
+        const customChoice = this.getCustomChoiceForQuestion(question);
+        
+        let selectedInput = null;
+        
+        if (customChoice) {
+            this.log(`🎯 Looking for custom choice: "${customChoice}"`);
+            
+            // Try multiple matching methods
+            const matchingMethods = [
+                // Method 1: Exact match (case insensitive)
+                (label, choice) => label.toLowerCase().trim() === choice.toLowerCase().trim(),
+                // Method 2: Label contains choice
+                (label, choice) => label.toLowerCase().includes(choice.toLowerCase()),
+                // Method 3: Choice contains label (for short answers)
+                (label, choice) => choice.toLowerCase().includes(label.toLowerCase()),
+                // Method 4: Remove common words and match
+                (label, choice) => {
+                    const cleanLabel = label.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                    const cleanChoice = choice.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                    return cleanLabel === cleanChoice || cleanLabel.includes(cleanChoice) || cleanChoice.includes(cleanLabel);
+                }
+            ];
+            
+            // Try each matching method
+            for (let i = 0; i < matchingMethods.length && !selectedInput; i++) {
+                selectedInput = Array.from(radioInputs).find(input => {
+                    const label = this.getInputLabel(input);
+                    if (!label) return false;
+                    
+                    const matches = matchingMethods[i](label, customChoice);
+                    if (matches) {
+                        this.log(`🎯 Method ${i + 1} match: "${label}" ↔ "${customChoice}"`);
+                    }
+                    return matches;
+                });
+                
+                if (selectedInput) {
+                    this.log(`✅ Found custom choice match using method ${i + 1}: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+                }
+            }
+            
+            if (!selectedInput) {
+                this.log(`⚠️ No matching option found for custom choice: "${customChoice}"`);
+                // Debug: log all available options
+                this.log(`📋 Available options:`);
+                Array.from(radioInputs).forEach((input, index) => {
+                    const label = this.getInputLabel(input);
+                    this.log(`   ${index + 1}. "${label}"`);
+                });
+            }
+        }
+        
+        // If no custom choice found, use selection strategy
+        if (!selectedInput) {
+            // Check multiple possible strategy keys from different versions
+            let strategy = this.currentFormData.selectionStrategy || this.currentFormData.radioStrategy || 'random';
+            
+            // If avoidOther is explicitly set to true, override the strategy
+            if (this.currentFormData.avoidOther === true) {
+                strategy = 'avoid_other';
+                this.log(`🎯 Overriding strategy to 'avoid_other' due to avoidOther=true`);
+            }
+                           
+            this.log(`🎯 Using selection strategy: ${strategy}`);
+            this.log(`📋 Available strategies from form data: selectionStrategy=${this.currentFormData.selectionStrategy}, radioStrategy=${this.currentFormData.radioStrategy}, avoidOther=${this.currentFormData.avoidOther}`);
+            
+            selectedInput = this.selectByStrategy(radioInputs, strategy);
+        }
+        
+        if (selectedInput) {
+            await this.selectRadioChoice(selectedInput);
+        } else {
+            this.log('❌ No suitable radio option found', 'error');
+        }
+    }
+
+    getCustomChoiceForQuestion(question) {
+        // Enhanced custom choice detection with multiple matching strategies
+        const questionText = this.getQuestionText(question.element);
+        
+        if (!questionText) {
+            this.log(`⚠️ No question text found for custom choice matching`);
+            return null;
+        }
+        
+        this.log(`🔍 ENHANCED custom choice search for: "${questionText.substring(0, 80)}..."`);
+        
+        // Check for special questions (fixed answers) from popup
+        if (this.currentFormData.specialQuestions && this.currentFormData.specialQuestions.length > 0) {
+            this.log(`� Checking ${this.currentFormData.specialQuestions.length} special questions with enhanced matching:`);
+            
+            const bestMatch = this.findBestSpecialQuestionMatch(questionText, this.currentFormData.specialQuestions);
+            
+            if (bestMatch) {
+                this.log(`✅ BEST MATCH found: "${bestMatch.specialQuestion.keyword}" → "${bestMatch.specialQuestion.answer}" (score: ${bestMatch.score.toFixed(3)}, method: ${bestMatch.method})`);
+                return bestMatch.specialQuestion.answer;
+            }
+            
+            this.log(`⚠️ No matching special question found with enhanced matching`);
+        }
+        
+        // Fallback: check for custom fields (legacy support)
+        if (this.currentFormData.customFields && this.currentFormData.customFields.length > 0) {
+            this.log(`🔄 Checking ${this.currentFormData.customFields.length} legacy custom fields:`);
+            
+            for (const field of this.currentFormData.customFields) {
+                if (field.question && field.value) {
+                    const matchScore = this.calculateTextMatchScore(questionText, field.question);
+                    this.log(`   - "${field.question}" → "${field.value}" (score: ${matchScore.toFixed(3)})`);
+                    
+                    if (matchScore > 0.6) { // 60% similarity threshold
+                        this.log(`✅ Legacy custom field match: "${field.question}" → "${field.value}"`);
+                        return field.value;
+                    }
+                }
+            }
+        }
+        
+        return null;
+    }
+
+    findBestSpecialQuestionMatch(questionText, specialQuestions) {
+        const matches = [];
+        
+        for (const specialQuestion of specialQuestions) {
+            if (!specialQuestion.keyword || !specialQuestion.answer) {
+                continue;
+            }
+            
+            // Multiple matching strategies with scoring
+            const matchStrategies = [
+                {
+                    name: 'exact_match',
+                    score: this.calculateExactMatch(questionText, specialQuestion.keyword),
+                    weight: 1.0
+                },
+                {
+                    name: 'contains_match',
+                    score: this.calculateContainsMatch(questionText, specialQuestion.keyword),
+                    weight: 0.9
+                },
+                {
+                    name: 'fuzzy_match',
+                    score: this.calculateFuzzyMatch(questionText, specialQuestion.keyword),
+                    weight: 0.8
+                },
+                {
+                    name: 'word_overlap',
+                    score: this.calculateWordOverlap(questionText, specialQuestion.keyword),
+                    weight: 0.7
+                },
+                {
+                    name: 'partial_match',
+                    score: this.calculatePartialMatch(questionText, specialQuestion.keyword),
+                    weight: 0.6
+                }
+            ];
+            
+            // Find best strategy for this special question
+            const bestStrategy = matchStrategies.reduce((best, current) => {
+                const weightedScore = current.score * current.weight;
+                const bestWeightedScore = best.score * best.weight;
+                return weightedScore > bestWeightedScore ? current : best;
+            });
+            
+            const finalScore = bestStrategy.score * bestStrategy.weight;
+            
+            this.log(`   - "${specialQuestion.keyword}" → "${specialQuestion.answer}" | ${bestStrategy.name}: ${finalScore.toFixed(3)}`);
+            
+            if (finalScore > 0.5) { // Minimum threshold for consideration
+                matches.push({
+                    specialQuestion,
+                    score: finalScore,
+                    method: bestStrategy.name
+                });
+            }
+        }
+        
+        // Return best match if any
+        if (matches.length > 0) {
+            matches.sort((a, b) => b.score - a.score);
+            return matches[0];
+        }
+        
+        return null;
+    }
+
+    calculateExactMatch(text1, text2) {
+        const clean1 = this.cleanTextForMatching(text1);
+        const clean2 = this.cleanTextForMatching(text2);
+        return clean1 === clean2 ? 1.0 : 0.0;
+    }
+
+    calculateContainsMatch(questionText, keyword) {
+        const cleanQuestion = this.cleanTextForMatching(questionText);
+        const cleanKeyword = this.cleanTextForMatching(keyword);
+        
+        if (cleanQuestion.includes(cleanKeyword)) {
+            // Score based on keyword length relative to question length
+            return Math.min(1.0, cleanKeyword.length / cleanQuestion.length + 0.5);
+        }
+        
+        // Check reverse containment (keyword contains question parts)
+        if (cleanKeyword.includes(cleanQuestion)) {
+            return Math.min(1.0, cleanQuestion.length / cleanKeyword.length + 0.3);
+        }
+        
+        return 0.0;
+    }
+
+    calculateFuzzyMatch(text1, text2) {
+        // Simple Levenshtein distance-based similarity
+        const clean1 = this.cleanTextForMatching(text1);
+        const clean2 = this.cleanTextForMatching(text2);
+        
+        const distance = this.levenshteinDistance(clean1, clean2);
+        const maxLength = Math.max(clean1.length, clean2.length);
+        
+        if (maxLength === 0) return 1.0;
+        
+        return Math.max(0, 1 - distance / maxLength);
+    }
+
+    calculateWordOverlap(text1, text2) {
+        const words1 = new Set(this.extractSignificantWords(text1));
+        const words2 = new Set(this.extractSignificantWords(text2));
+        
+        if (words1.size === 0 || words2.size === 0) return 0.0;
+        
+        const intersection = new Set([...words1].filter(word => words2.has(word)));
+        const union = new Set([...words1, ...words2]);
+        
+        return intersection.size / union.size; // Jaccard similarity
+    }
+
+    calculatePartialMatch(questionText, keyword) {
+        const cleanQuestion = this.cleanTextForMatching(questionText);
+        const cleanKeyword = this.cleanTextForMatching(keyword);
+        
+        // Check if significant portions match
+        const keywordWords = cleanKeyword.split(/\s+/);
+        const questionWords = cleanQuestion.split(/\s+/);
+        
+        let matchingWords = 0;
+        
+        for (const keywordWord of keywordWords) {
+            if (keywordWord.length > 2) { // Only consider words longer than 2 chars
+                for (const questionWord of questionWords) {
+                    if (questionWord.includes(keywordWord) || keywordWord.includes(questionWord)) {
+                        matchingWords++;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        return keywordWords.length > 0 ? matchingWords / keywordWords.length : 0.0;
+    }
+
+    calculateTextMatchScore(text1, text2) {
+        // Composite scoring combining multiple methods
+        const exactScore = this.calculateExactMatch(text1, text2);
+        if (exactScore > 0) return exactScore;
+        
+        const containsScore = this.calculateContainsMatch(text1, text2);
+        const fuzzyScore = this.calculateFuzzyMatch(text1, text2);
+        const wordScore = this.calculateWordOverlap(text1, text2);
+        const partialScore = this.calculatePartialMatch(text1, text2);
+        
+        // Weighted average
+        return (containsScore * 0.3 + fuzzyScore * 0.3 + wordScore * 0.25 + partialScore * 0.15);
+    }
+
+    cleanTextForMatching(text) {
+        if (!text) return '';
+        
+        return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ') // Replace punctuation with spaces
+            .replace(/\s+/g, ' ')     // Normalize whitespace
+            .trim();
+    }
+
+    extractSignificantWords(text) {
+        if (!text) return [];
+        
+        // Common stop words to filter out
+        const stopWords = new Set([
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those'
+        ]);
+        
+        return this.cleanTextForMatching(text)
+            .split(/\s+/)
+            .filter(word => word.length > 2 && !stopWords.has(word));
+    }
+
+    levenshteinDistance(str1, str2) {
+        const matrix = [];
+        
+        for (let i = 0; i <= str2.length; i++) {
+            matrix[i] = [i];
+        }
+        
+        for (let j = 0; j <= str1.length; j++) {
+            matrix[0][j] = j;
+        }
+        
+        for (let i = 1; i <= str2.length; i++) {
+            for (let j = 1; j <= str1.length; j++) {
+                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        matrix[i][j - 1] + 1,     // insertion
+                        matrix[i - 1][j] + 1      // deletion
+                    );
+                }
+            }
+        }
+        
+        return matrix[str2.length][str1.length];
+    }
+
+    getQuestionText(element) {
+        // Try multiple selectors to get question text
+        const textSelectors = [
+            '.question-title',
+            '[data-automation-id="questionTitle"]',
+            '.office-form-question-title',
+            'h2', 'h3', 'h4',
+            '.text-format-content'
+        ];
+        
+        for (const selector of textSelectors) {
+            const textElement = element.querySelector(selector);
+            if (textElement && textElement.textContent.trim()) {
+                return textElement.textContent.trim();
+            }
+        }
+        
+        // Fallback: get first meaningful text
+        const allText = element.textContent.trim();
+        return allText.split('\n')[0] || allText.substring(0, 100);
+    }
+
+    selectByStrategy(inputs, strategy) {
+        const visibleInputs = Array.from(inputs).filter(this.isElementVisible.bind(this));
+        
+        this.log(`🔍 selectByStrategy: ${inputs.length} total inputs, ${visibleInputs.length} visible inputs`);
+        
+        if (visibleInputs.length === 0) {
+            this.log('❌ No visible inputs found', 'warning');
+            return null;
+        }
+        
+        this.log(`🎯 Applying strategy: ${strategy}`);
+        
+        let selectedInput = null;
+        
+        // Check if this looks like a rating/Likert scale question
+        const isRatingQuestion = this.isRatingScale(visibleInputs);
+        this.log(`🔍 Rating scale detection result: ${isRatingQuestion}`);
+        
+        if (isRatingQuestion) {
+            const settingsMin = this.currentFormData.ratingMin || 4;
+            const settingsMax = this.currentFormData.ratingMax || 5;
+            this.log(`🎯 Detected rating/Likert scale - using rating strategy with range ${settingsMin}-${settingsMax}`);
+            
+            selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(visibleInputs), settingsMin, settingsMax);
+            
+            if (selectedInput) {
+                const selectedRating = Array.from(visibleInputs).indexOf(selectedInput) + 1;
+                this.log(`🎯 Selected rating ${selectedRating}/${visibleInputs.length} based on settings`);
+            } else {
+                this.log('⚠️ Rating selection returned null, falling back to strategy');
+            }
+        }
+        
+        // If not a rating question or rating selection failed, use original strategy
+        if (!selectedInput) {
+            switch (strategy) {
+                case 'first':
+                    selectedInput = visibleInputs[0];
+                    this.log(`🎯 Selected first option: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+                case 'last':
+                    selectedInput = visibleInputs[visibleInputs.length - 1];
+                    this.log(`🎯 Selected last option: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+                case 'middle':
+                    selectedInput = visibleInputs[Math.floor(visibleInputs.length / 2)];
+                    this.log(`🎯 Selected middle option: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+                case 'avoid_other':
+                    this.log('🔍 Calling selectAvoidingOther...');
+                    selectedInput = this.selectAvoidingOther(visibleInputs);
+                    break;
+                case 'random':
+                default:
+                    selectedInput = visibleInputs[Math.floor(Math.random() * visibleInputs.length)];
+                    this.log(`🎯 Selected random option: "${this.getInputLabel(selectedInput)}"`);
+                    break;
+            }
+        }
+        
+        if (!selectedInput) {
+            this.log('❌ Strategy returned null - no option selected', 'error');
+        }
+        
+        return selectedInput;
+    }
+
+    isRatingScale(inputs) {
+        if (inputs.length < 3) {
+            this.log(`🔍 Not rating scale: too few inputs (${inputs.length})`);
+            return false; // Rating scales usually have at least 3 options
+        }
+        
+        // Check if labels are numeric (1, 2, 3, 4, 5) or contain rating-related keywords
+        let numericCount = 0;
+        let ratingKeywordCount = 0;
+        const labelsToCheck = inputs.slice(0, Math.min(5, inputs.length));
+        
+        this.log(`🔍 Checking ${labelsToCheck.length} inputs for rating scale patterns`);
+        
+        for (const input of labelsToCheck) {
+            const label = this.getInputLabel(input);
+            this.log(`🔍 Input label: "${label}"`);
+            
+            if (label) {
+                const cleanLabel = label.trim().toLowerCase();
+                
+                // Check for pure numeric labels (1, 2, 3, etc.)
+                if (/^\d+$/.test(cleanLabel)) {
+                    numericCount++;
+                    this.log(`📊 Found numeric label: ${cleanLabel}`);
+                }
+                
+                // Check for rating-related keywords
+                const ratingKeywords = [
+                    'strongly disagree', 'disagree', 'neutral', 'agree', 'strongly agree',
+                    'rất không đồng ý', 'không đồng ý', 'trung tính', 'đồng ý', 'rất đồng ý',
+                    'very dissatisfied', 'dissatisfied', 'satisfied', 'very satisfied',
+                    'rất không hài lòng', 'không hài lòng', 'hài lòng', 'rất hài lòng',
+                    'never', 'rarely', 'sometimes', 'often', 'always',
+                    'không bao giờ', 'hiếm khi', 'thỉnh thoảng', 'thường xuyên', 'luôn luôn',
+                    'poor', 'fair', 'good', 'very good', 'excellent',
+                    'kém', 'tạm được', 'tốt', 'rất tốt', 'xuất sắc'
+                ];
+                
+                const matchedKeyword = ratingKeywords.find(keyword => cleanLabel.includes(keyword));
+                if (matchedKeyword) {
+                    ratingKeywordCount++;
+                    this.log(`🔍 Found rating keyword: "${matchedKeyword}" in "${cleanLabel}"`);
+                }
+            }
+        }
+        
+        // It's a rating scale if:
+        // 1. Most labels are numeric (like 1, 2, 3, 4, 5)
+        // 2. Contains rating-related keywords in sequence
+        const isNumericScale = numericCount >= Math.min(3, inputs.length * 0.6);
+        const hasRatingKeywords = ratingKeywordCount >= Math.min(2, inputs.length * 0.4);
+        
+        const isRating = isNumericScale || hasRatingKeywords;
+        
+        this.log(`🔍 Rating scale analysis: numeric=${numericCount}/${inputs.length} (threshold: ${Math.min(3, inputs.length * 0.6)}), keywords=${ratingKeywordCount}/${inputs.length} (threshold: ${Math.min(2, inputs.length * 0.4)})`);
+        this.log(`🎯 Final rating scale result: ${isRating} (numeric: ${isNumericScale}, keywords: ${hasRatingKeywords})`);
+        
+        return isRating;
+    }
+
+    selectAvoidingOther(inputs) {
+        // Try to avoid "Other", "Khác", "N/A" options using multiple methods
+        const avoidKeywords = ['other', 'khác', 'n/a', 'không có', 'không', 'none', 'khác (xin ghi rõ)', 'specify', 'chi tiết'];
+        
+        this.log(`🔍 Analyzing ${inputs.length} inputs to avoid "other" options`);
+        
+        const inputsArray = this.ensureArray(inputs);
+        const preferredInputs = inputsArray.filter(input => {
+            const label = this.getInputLabel(input).toLowerCase();
+            
+            // Method 1: Check label text
+            const hasOtherKeyword = avoidKeywords.some(keyword => label.includes(keyword));
+            
+            // Method 2: Check if this is likely an "Other" option by DOM structure
+            let isLikelyOther = false;
+            
+            // Check if there's a text input nearby (common for "Other" options)
+            const parent = input.parentElement;
+            const hasTextInput = parent && (
+                parent.querySelector('input[type="text"]') ||
+                parent.querySelector('textarea') ||
+                parent.nextElementSibling?.querySelector('input[type="text"]') ||
+                parent.nextElementSibling?.querySelector('textarea')
+            );
+            
+            // Check for common "Other" attributes or classes
+            const hasOtherAttributes = 
+                input.value?.toLowerCase().includes('other') ||
+                input.id?.toLowerCase().includes('other') ||
+                input.className?.toLowerCase().includes('other') ||
+                parent?.className?.toLowerCase().includes('other');
+            
+            // Check if this is the last option (often "Other" is placed last)
+            const allInputsInGroup = inputs;
+            const isLastOption = allInputsInGroup.indexOf(input) === allInputsInGroup.length - 1;
+            
+            isLikelyOther = hasTextInput || hasOtherAttributes || (isLastOption && hasOtherKeyword);
+            
+            const shouldAvoid = hasOtherKeyword || isLikelyOther;
+            
+            this.log(`📋 Option: "${label}" - Text:${hasOtherKeyword ? 'OTHER' : 'OK'}, Structure:${isLikelyOther ? 'OTHER' : 'OK'} -> ${shouldAvoid ? 'AVOIDED' : 'OK'}`);
+            
+            return !shouldAvoid;
+        });
+        
+        this.log(`✅ Found ${preferredInputs.length} preferred options out of ${inputs.length} total`);
+        
+        if (preferredInputs.length > 0) {
+            const selected = preferredInputs[Math.floor(Math.random() * preferredInputs.length)];
+            this.log(`🎯 Selected preferred option: "${this.getInputLabel(selected)}"`);
+            return selected;
+        }
+        
+        // If all options are flagged as "other", select the first non-last option
+        this.log(`⚠️ All options flagged as "other", trying to select non-last option...`);
+        if (inputs.length > 1) {
+            // Select from first n-1 options (avoid the last one which is most likely "Other")
+            const nonLastOptions = inputs.slice(0, -1);
+            const selected = nonLastOptions[Math.floor(Math.random() * nonLastOptions.length)];
+            this.log(`🎯 Selected non-last option: "${this.getInputLabel(selected)}"`);
+            return selected;
+        }
+        
+        // Last resort - pick randomly
+        const selected = inputs[Math.floor(Math.random() * inputs.length)];
+        this.log(`⚠️ Last resort random selection: "${this.getInputLabel(selected)}"`);
+        return selected;
+    }
+
+    getInputLabel(input) {
+        let labelText = '';
+        
+        // Method 1: Check aria-label first
+        labelText = input.getAttribute('aria-label');
+        if (labelText && labelText.trim()) {
+            return labelText.trim();
+        }
+        
+        // Method 2: Try closest label element
+        const labelElement = input.closest('label');
+        if (labelElement) {
+            labelText = labelElement.textContent.trim();
+            if (labelText) return labelText;
+        }
+        
+        // Method 3: Try label[for] association
+        if (input.id) {
+            const associatedLabel = document.querySelector(`label[for="${input.id}"]`);
+            if (associatedLabel) {
+                labelText = associatedLabel.textContent.trim();
+                if (labelText) return labelText;
+            }
+        }
+        
+        // Method 4: Microsoft Forms specific - look for span siblings
+        const parent = input.parentElement;
+        if (parent) {
+            // Look for span elements with text content
+            const spans = parent.querySelectorAll('span');
+            for (const span of spans) {
+                const text = span.textContent.trim();
+                if (text && text !== input.value && !span.contains(input)) {
+                    labelText = text;
+                    break;
+                }
+            }
+            if (labelText) return labelText;
+        }
+        
+        // Method 5: Try parent's text content (excluding input)
+        if (parent) {
+            let parentText = parent.textContent.trim();
+            // Remove input value from parent text if it exists
+            if (input.value) {
+                parentText = parentText.replace(input.value, '').trim();
+            }
+            if (parentText) {
+                labelText = parentText;
+            }
+        }
+        
+        // Method 6: Look in grandparent or higher ancestors
+        let ancestor = parent?.parentElement;
+        let attempts = 0;
+        while (ancestor && attempts < 3 && !labelText) {
+            const ancestorSpans = ancestor.querySelectorAll('span');
+            for (const span of ancestorSpans) {
+                const text = span.textContent.trim();
+                if (text && 
+                    text !== input.value && 
+                    !span.contains(input) && 
+                    text.length > 1 && 
+                    text.length < 200) { // Reasonable text length
+                    labelText = text;
+                    break;
+                }
+            }
+            ancestor = ancestor.parentElement;
+            attempts++;
+        }
+        
+        // Method 7: Try div siblings with text
+        if (!labelText && parent) {
+            const siblings = Array.from(parent.parentElement?.children || []);
+            for (const sibling of siblings) {
+                if (sibling !== parent && sibling.textContent.trim() && !sibling.contains(input)) {
+                    const text = sibling.textContent.trim();
+                    if (text.length > 1 && text.length < 200) {
+                        labelText = text;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Method 8: Last resort - use input value or placeholder
+        if (!labelText) {
+            labelText = input.value || input.placeholder || input.getAttribute('title') || '';
+        }
+        
+        // Clean up the label text
+        if (labelText) {
+            labelText = labelText.trim();
+            // Remove common artifacts
+            labelText = labelText.replace(/^\s*\|\s*/, '').trim(); // Remove leading |
+            labelText = labelText.replace(/\s+/g, ' '); // Normalize whitespace
+        }
+        
+        return labelText || 'Unknown Option';
+    }
+
+    async selectRadioChoice(input) {
+        try {
+            if (!input) {
+                this.log('❌ Input element is null/undefined', 'error');
+                return false;
+            }
+
+            this.log(`🎯 Selecting radio choice: "${this.getInputLabel(input)}"`);
+            
+            // Scroll into view
+            if (input.scrollIntoView) {
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await this.sleep(300);
+            }
+            
+            // Try multiple click methods
+            const clickMethods = [
+                () => input.click(),
+                () => input.focus() && input.click(),
+                () => {
+                    const label = input.closest('label') || input.parentElement;
+                    if (label) label.click();
+                },
+                () => input.dispatchEvent(new MouseEvent('click', { bubbles: true })),
+                () => {
+                    input.checked = true;
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                },
+                () => {
+                    const parent = input.closest('[role="radio"]');
+                    if (parent) parent.click();
+                }
+            ];
+            
+            for (let i = 0; i < clickMethods.length; i++) {
+                try {
+                    this.log(`🔄 Trying click method ${i + 1}`);
+                    clickMethods[i]();
+                    await this.sleep(200);
+                    
+                    if (input.checked) {
+                        this.log(`✅ Successfully selected radio option using method ${i + 1}`);
+                        return true;
+                    }
+                } catch (error) {
+                    this.log(`⚠️ Click method ${i + 1} failed: ${error.message}`);
+                }
+            }
+            
+            this.log('❌ All click methods failed for radio selection', 'error');
+            return false;
+            
+        } catch (error) {
+            this.log(`❌ Error selecting radio choice: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    async fillCheckboxQuestion(question) {
+        const checkboxInputs = question.element.querySelectorAll('input[type="checkbox"]');
+        
+        if (checkboxInputs.length === 0) {
+            this.log('⚠️ No checkbox inputs found', 'warning');
+            return;
+        }
+        
+        this.log(`☑️ Found ${checkboxInputs.length} checkbox options`);
+        
+        // For checkboxes, we can select multiple options
+        const maxSelections = Math.min(
+            checkboxInputs.length,
+            this.currentFormData.maxCheckboxSelections || Math.ceil(checkboxInputs.length / 2)
+        );
+        
+        const numToSelect = Math.floor(Math.random() * maxSelections) + 1;
+        const shuffled = Array.from(checkboxInputs).sort(() => 0.5 - Math.random());
+        
+        for (let i = 0; i < numToSelect; i++) {
+            await this.selectCheckboxChoice(shuffled[i]);
+            await this.delay(200, 400);
+        }
+    }
+
+    async selectCheckboxChoice(input) {
+        try {
+            this.log(`☑️ Selecting checkbox: "${this.getInputLabel(input)}"`);
+            
+            input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.sleep(200);
+            
+            input.click();
+            await this.sleep(100);
+            
+            if (input.checked) {
+                this.log('✅ Checkbox selected successfully');
+            } else {
+                this.log('⚠️ Checkbox selection may have failed');
+            }
+            
+        } catch (error) {
+            this.log(`❌ Error selecting checkbox: ${error.message}`, 'error');
+        }
+    }
+
+    async fillTextQuestion(question) {
+        const textInputs = question.element.querySelectorAll('input[type="text"], textarea');
+        
+        if (textInputs.length === 0) {
+            this.log('⚠️ No text inputs found', 'warning');
+            return;
+        }
+        
+        for (const input of textInputs) {
+            const customText = this.getCustomTextForQuestion(question) || 
+                             this.generateRandomText(input);
+            
+            await this.fillTextInput(input, customText);
+            await this.delay(200, 400);
+        }
+    }
+
+    getCustomTextForQuestion(question) {
+        const questionText = this.getQuestionText(question.element);
+        
+        if (!questionText || !this.currentFormData.customFields) {
+            return null;
+        }
+        
+        for (const field of this.currentFormData.customFields) {
+            if (field.question && questionText.toLowerCase().includes(field.question.toLowerCase())) {
+                return field.value;
+            }
+        }
+        
+        return null;
+    }
+
+    generateRandomText(input) {
+        const placeholder = input.placeholder || input.getAttribute('aria-label') || '';
+        
+        // Generate appropriate text based on input type or placeholder
+        if (placeholder.toLowerCase().includes('email') || placeholder.toLowerCase().includes('e-mail')) {
+            return `user${Math.floor(Math.random() * 1000)}@example.com`;
+        } else if (placeholder.toLowerCase().includes('phone')) {
+            return `09${Math.floor(Math.random() * 100000000).toString().padStart(8, '0')}`;
+        } else if (placeholder.toLowerCase().includes('name')) {
+            const names = ['Nguyen Van A', 'Tran Thi B', 'Le Van C', 'Pham Thi D'];
+            return names[Math.floor(Math.random() * names.length)];
+        } else {
+            return `Sample text ${Math.floor(Math.random() * 1000)}`;
+        }
+    }
+
+    async fillTextInput(input, text) {
+        try {
+            if (!input) {
+                this.log('❌ Input element is null/undefined', 'error');
+                return false;
+            }
+
+            this.log(`📝 Filling text input with: "${text}"`);
+            
+            // Check if input is disabled or readonly
+            if (input.disabled || input.readOnly) {
+                this.log('⚠️ Input is disabled or readonly, skipping', 'warning');
+                return false;
+            }
+
+            if (input.scrollIntoView) {
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await this.sleep(200);
+            }
+            
+            if (input.focus) {
+                input.focus();
+            }
+            input.value = '';
+            await this.sleep(100);
+            
+            // Type character by character for more natural behavior
+            for (const char of text) {
+                input.value += char;
+                if (input.dispatchEvent) {
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                await this.sleep(50);
+            }
+            
+            if (input.dispatchEvent) {
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (input.blur) {
+                input.blur();
+            }
+            
+            this.log('✅ Text input filled successfully');
+            return true;
+            
+        } catch (error) {
+            this.log(`❌ Error filling text input: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    async fillRatingQuestion(question) {
+        const ratingElements = question.element.querySelectorAll('[role="slider"], .rating-component input, .rating-scale input');
+        
+        if (ratingElements.length === 0) {
+            this.log('⚠️ No rating elements found', 'warning');
+            return;
+        }
+        
+        for (const ratingElement of ratingElements) {
+            await this.setRatingValue(ratingElement);
+            await this.delay(200, 400);
+        }
+    }
+
+    async setRatingValue(element) {
+        try {
+            const elementMin = parseInt(element.getAttribute('aria-valuemin') || '1');
+            const elementMax = parseInt(element.getAttribute('aria-valuemax') || '5');
+            
+            // Use settings from popup for rating range
+            const settingsMin = this.currentFormData.ratingMin || 4;
+            const settingsMax = this.currentFormData.ratingMax || 5;
+            
+            this.log(`🎯 Rating settings loaded - Min: ${settingsMin}, Max: ${settingsMax}`);
+            this.log(`📊 Element bounds - Min: ${elementMin}, Max: ${elementMax}`);
+            
+            // Make sure the settings range is within element bounds
+            const actualMin = Math.max(elementMin, settingsMin);
+            const actualMax = Math.min(elementMax, settingsMax);
+            
+            // If settings range is invalid, use element range
+            const finalMin = actualMin <= actualMax ? actualMin : elementMin;
+            const finalMax = actualMin <= actualMax ? actualMax : elementMax;
+            
+            // Generate weighted random value favoring higher ratings
+            let selectedValue;
+            if (finalMin === finalMax) {
+                selectedValue = finalMin;
+            } else {
+                // Weighted selection favoring higher values
+                const range = finalMax - finalMin + 1;
+                const weights = [];
+                for (let i = 0; i < range; i++) {
+                    weights.push(Math.pow(2, i + 1)); // Exponential weight favoring higher values
+                }
+                const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+                let random = Math.random() * totalWeight;
+                
+                for (let i = weights.length - 1; i >= 0; i--) {
+                    random -= weights[i];
+                    if (random <= 0) {
+                        selectedValue = finalMax - i;
+                        break;
+                    }
+                }
+                
+                if (!selectedValue) {
+                    selectedValue = finalMax; // fallback to highest
+                }
+            }
+            
+            this.log(`⭐ Setting rating to: ${selectedValue}/${elementMax} (range: ${finalMin}-${finalMax}, settings: ${settingsMin}-${settingsMax})`);
+            
+            element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.sleep(200);
+            
+            if (element.tagName === 'INPUT') {
+                element.value = selectedValue;
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            } else {
+                element.setAttribute('aria-valuenow', selectedValue);
+                element.click();
+            }
+            
+            this.log('✅ Rating set successfully');
+            
+        } catch (error) {
+            this.log(`❌ Error setting rating: ${error.message}`, 'error');
+        }
+    }
+
+    async fillSelectQuestion(question) {
+        const selectElements = question.element.querySelectorAll('select');
+        
+        if (selectElements.length === 0) {
+            this.log('⚠️ No select elements found', 'warning');
+            return;
+        }
+        
+        for (const select of selectElements) {
+            await this.selectRandomOption(select);
+            await this.delay(200, 400);
+        }
+    }
+
+    async selectRandomOption(select) {
+        try {
+            const options = Array.from(select.options).filter(option => option.value && option.value !== '');
+            
+            if (options.length === 0) {
+                this.log('⚠️ No valid options found in select', 'warning');
+                return;
+            }
+            
+            const randomOption = options[Math.floor(Math.random() * options.length)];
+            
+            this.log(`🔽 Selecting option: "${randomOption.text}"`);
+            
+            select.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.sleep(200);
+            
+            select.value = randomOption.value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            
+            this.log('✅ Select option chosen successfully');
+            
+        } catch (error) {
+            this.log(`❌ Error selecting option: ${error.message}`, 'error');
+        }
+    }
+
+    async fillMatrixQuestion(question) {
+        this.log(`📊 Processing Matrix/Likert question...`);
+        
+        // Method 1: Check for new Microsoft Forms Likert structure with likerSubQuestion
+        let likertSubQuestions = question.element.querySelectorAll('[data-automation-id="likerSubQuestion"]');
+        
+        if (likertSubQuestions.length > 0) {
+            this.log(`📋 Found ${likertSubQuestions.length} Likert sub-questions using new structure`);
+            return await this.fillLikertSubQuestions(likertSubQuestions);
+        }
+        
+        // Method 2: Legacy - Find Likert table rows using multiple selectors like console script
+        let matrixRows = question.element.querySelectorAll('tr[role="radiogroup"]');
+        
+        if (matrixRows.length === 0) {
+            // Try alternative row selectors like console script
+            matrixRows = question.element.querySelectorAll('tr');
+            this.log(`🔍 No radiogroup rows found, trying all tr elements: ${matrixRows.length}`);
+            
+            // Filter for rows that have radio inputs
+            matrixRows = Array.from(matrixRows).filter(row => {
+                const radios = row.querySelectorAll('input[type="radio"]');
+                return radios.length > 0;
+            });
+        }
+        
+        if (matrixRows.length === 0) {
+            this.log('⚠️ No matrix rows found - this might be a misidentified question type', 'warning');
+            
+            // Fallback: try to handle as regular radio question if it has radio inputs
+            const radioInputs = question.element.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length > 0) {
+                this.log(`🔄 Fallback: treating as radio question with ${radioInputs.length} options`);
+                // Convert to radio question format and process
+                const radioQuestion = {
+                    ...question,
+                    type: 'radio'
+                };
+                await this.fillRadioQuestion(radioQuestion);
+                return;
+            }
+            
+            this.log('⚠️ No fallback possible - skipping question');
+            return;
+        }
+        
+        this.log(`📊 Found ${matrixRows.length} Likert scale rows to fill (legacy structure)`);
+        return await this.fillLikertTableRows(matrixRows);
+    }
+    
+    async fillLikertSubQuestions(likertSubQuestions) {
+        const settingsMin = this.currentFormData.ratingMin || 4;
+        const settingsMax = this.currentFormData.ratingMax || 5;
+        
+        this.log(`📊 Likert sub-questions settings - Min: ${settingsMin}, Max: ${settingsMax}`);
+        
+        for (const subQuestion of likertSubQuestions) {
+            try {
+                // Get the question text from the sub-question
+                const questionTextElement = subQuestion.querySelector('.text-format-content, [class*="-qh-"]');
+                const questionText = questionTextElement ? questionTextElement.textContent.trim() : 'Unknown question';
+                
+                this.log(`📋 Processing Likert sub-question: ${questionText.substring(0, 80)}...`);
+                
+                // Find all radio inputs in this sub-question
+                let radioInputs = subQuestion.querySelectorAll('input[type="radio"]');
+                
+                if (radioInputs.length === 0) {
+                    this.log(`⚠️ No radio inputs found in sub-question`, 'warning');
+                    continue;
+                }
+                
+                this.log(`Found ${radioInputs.length} rating options (1-${radioInputs.length})`);
+                
+                // Debug: Log all radio inputs found
+                Array.from(radioInputs).forEach((radio, index) => {
+                    const value = radio.value;
+                    const automationValue = radio.getAttribute('data-automation-value');
+                    const ariaLabel = radio.getAttribute('aria-label');
+                    const name = radio.name;
+                    this.log(`   Radio ${index + 1}: value="${value}", automation-value="${automationValue}", aria-label="${ariaLabel}", name="${name}"`);
+                });
+                
+                // Use position-based selection
+                const selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(radioInputs), settingsMin, settingsMax);
+                
+                if (selectedInput) {
+                    // Get display information
+                    const ariaLabel = selectedInput.getAttribute('aria-label');
+                    const value = selectedInput.value;
+                    const automationValue = selectedInput.getAttribute('data-automation-value');
+                    const displayValue = ariaLabel || value || automationValue || 'unknown';
+                    const actualPosition = ariaLabel ? `position ${ariaLabel}` : `value ${value}`;
+                    
+                    this.log(`🎯 Selecting rating: ${displayValue} (${actualPosition}) for "${questionText.substring(0, 40)}..."`);
+                    
+                    // Use comprehensive click method
+                    const success = await this.selectRadioInputComprehensive(selectedInput);
+                    
+                    if (success) {
+                        this.log(`✅ Successfully selected: ${displayValue}`);
+                    } else {
+                        this.log(`❌ Failed to select: ${displayValue}`, 'error');
+                    }
+                } else {
+                    this.log(`❌ No suitable rating found for sub-question`, 'error');
+                }
+                
+                await this.delay(200, 400);
+                
+            } catch (error) {
+                this.log(`❌ Error processing Likert sub-question: ${error.message}`, 'error');
+            }
+        }
+    }
+    
+    async fillLikertTableRows(matrixRows) {
+        // Get rating settings from popup
+        const settingsMin = this.currentFormData.ratingMin || 4;
+        const settingsMax = this.currentFormData.ratingMax || 5;
+        
+        this.log(`📊 Matrix question rating settings - Min: ${settingsMin}, Max: ${settingsMax}`);
+        
+        for (const row of matrixRows) {
+            try {
+                // Get the statement text for this row
+                const statementElement = row.querySelector('[data-automation-id="likerStatementTd"]');
+                const statementText = statementElement ? statementElement.textContent.trim() : 'Unknown statement';
+                
+                this.log(`📋 Processing Likert row: ${statementText.substring(0, 60)}...`);
+                
+                // Find all radio inputs in this row - try multiple selectors like console script
+                let radioInputs = row.querySelectorAll('input[type="radio"][data-automation-id="radio"]');
+                
+                if (radioInputs.length === 0) {
+                    // Try alternative selectors
+                    radioInputs = row.querySelectorAll('input[type="radio"]');
+                    this.log(`🔍 Using fallback selector, found ${radioInputs.length} radio inputs`);
+                }
+                
+                if (radioInputs.length === 0) {
+                    this.log(`⚠️ No radio inputs found in row`, 'warning');
+                    continue;
+                }
+                
+                this.log(`Found ${radioInputs.length} rating options (1-${radioInputs.length})`);
+                
+                // Debug: Log all radio inputs found (like console script)
+                Array.from(radioInputs).forEach((radio, index) => {
+                    const value = radio.value;
+                    const automationValue = radio.getAttribute('data-automation-value');
+                    const ariaLabel = radio.getAttribute('aria-label');
+                    this.log(`   Radio ${index + 1}: value="${value}", automation-value="${automationValue}", aria-label="${ariaLabel}"`);
+                });
+                
+                // Use position-based selection like console script
+                const selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(radioInputs), settingsMin, settingsMax);
+                
+                if (selectedInput) {
+                    // Get display information
+                    const ariaLabel = selectedInput.getAttribute('aria-label');
+                    const value = selectedInput.value;
+                    const automationValue = selectedInput.getAttribute('data-automation-value');
+                    const displayValue = ariaLabel || value || automationValue || 'unknown';
+                    const actualPosition = ariaLabel ? `position ${ariaLabel}` : `value ${value}`;
+                    
+                    this.log(`🎯 Selecting rating: ${displayValue} (${actualPosition}) for "${statementText.substring(0, 40)}..."`);
+                    
+                    // Use comprehensive click method like console script
+                    const success = await this.selectRadioInputComprehensive(selectedInput);
+                    
+                    if (success) {
+                        this.log(`✅ Successfully selected: ${displayValue}`);
+                    } else {
+                        this.log(`❌ Failed to select: ${displayValue}`, 'error');
+                    }
+                } else {
+                    this.log(`❌ No suitable rating found for row`, 'error');
+                }
+                
+                await this.delay(200, 400);
+                
+            } catch (error) {
+                this.log(`❌ Error processing Likert row: ${error.message}`, 'error');
+            }
+        }
+    }
+
+    selectRatingFromInputsPositional(inputs, settingsMin, settingsMax) {
+        if (!inputs || inputs.length === 0) return null;
+        
+        // Convert NodeList to Array if needed - safe conversion
+        const inputsArray = this.ensureArray(inputs);
+        
+        this.log(`🔍 ENHANCED rating analysis for user range ${settingsMin}-${settingsMax} from ${inputsArray.length} inputs:`);
+        
+        // Enhanced input analysis with multiple detection strategies
+        const inputAnalysis = inputsArray.map((input, index) => {
+            const analysis = {
+                input,
+                index,
+                ariaLabel: input.getAttribute('aria-label') || '',
+                value: input.value || '',
+                id: input.id || '',
+                name: input.name || '',
+                automationValue: input.getAttribute('data-automation-value') || '',
+                detectedValues: []
+            };
+            
+            // Strategy 1: Extract from aria-label
+            const ariaMatch = analysis.ariaLabel.match(/(\d+)/);
+            if (ariaMatch) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(ariaMatch[1]), 
+                    source: 'aria-label',
+                    confidence: 0.9 
+                });
+            }
+            
+            // Strategy 2: Extract from value attribute
+            if (analysis.value && /^\d+$/.test(analysis.value)) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(analysis.value), 
+                    source: 'value',
+                    confidence: 0.8 
+                });
+            }
+            
+            // Strategy 3: Extract from automation value
+            if (analysis.automationValue && /^\d+$/.test(analysis.automationValue)) {
+                analysis.detectedValues.push({ 
+                    value: parseInt(analysis.automationValue), 
+                    source: 'automation-value',
+                    confidence: 0.7 
+                });
+            }
+            
+            // Strategy 4: Extract from ID
+            if (analysis.id) {
+                const idMatch = analysis.id.match(/(\d+)/);
+                if (idMatch) {
+                    analysis.detectedValues.push({ 
+                        value: parseInt(idMatch[1]), 
+                        source: 'id',
+                        confidence: 0.6 
+                    });
+                }
+            }
+            
+            // Strategy 5: Position-based (1-indexed)
+            analysis.detectedValues.push({ 
+                value: index + 1, 
+                source: 'position',
+                confidence: 0.5 
+            });
+            
+            // Select best detected value (highest confidence)
+            analysis.bestValue = analysis.detectedValues.length > 0 ? 
+                analysis.detectedValues.reduce((best, current) => 
+                    current.confidence > best.confidence ? current : best
+                ) : null;
+            
+            return analysis;
+        });
+        
+        // Log detailed analysis
+        this.log(`📊 Enhanced input analysis:`);
+        inputAnalysis.forEach(analysis => {
+            const best = analysis.bestValue;
+            this.log(`   [${analysis.index}] best: ${best.value} (${best.source}, conf: ${best.confidence}) | aria: "${analysis.ariaLabel}" | value: "${analysis.value}"`);
+        });
+        
+        // Apply strict user preference filtering
+        const validCandidates = inputAnalysis.filter(analysis => {
+            if (!analysis.bestValue) return false;
+            
+            const value = analysis.bestValue.value;
+            const isInRange = value >= settingsMin && value <= settingsMax;
+            
+            if (isInRange) {
+                this.log(`✅ VALID: input[${analysis.index}] value=${value} is in user range ${settingsMin}-${settingsMax}`);
+            } else {
+                this.log(`❌ EXCLUDED: input[${analysis.index}] value=${value} outside user range ${settingsMin}-${settingsMax}`);
+            }
+            
+            return isInRange;
+        });
+        
+        if (validCandidates.length === 0) {
+            this.log(`⚠️ STRICT COMPLIANCE: No options in user range ${settingsMin}-${settingsMax}`, 'warning');
+            this.log(`📋 Available values: [${inputAnalysis.map(a => a.bestValue?.value).join(', ')}]`);
+            
+            // Check if we should suggest scale adjustment
+            const allValues = inputAnalysis.map(a => a.bestValue?.value).filter(v => v);
+            const minAvailable = Math.min(...allValues);
+            const maxAvailable = Math.max(...allValues);
+            
+            this.log(`💡 SUGGESTION: Form scale is ${minAvailable}-${maxAvailable}, user preferences are ${settingsMin}-${settingsMax}`);
+            
+            // Return null to maintain strict compliance
+            return null;
+        }
+        
+        // Sort candidates by detected value for proper weighting
+        validCandidates.sort((a, b) => a.bestValue.value - b.bestValue.value);
+        
+        this.log(`🎯 Valid candidates (${validCandidates.length}):`);
+        validCandidates.forEach(candidate => {
+            this.log(`   Index ${candidate.index}: value ${candidate.bestValue.value} (${candidate.bestValue.source})`);
+        });
+        
+        // Enhanced weighted selection with user bias
+        const selectedCandidate = this.performEnhancedWeightedSelection(validCandidates, settingsMin, settingsMax);
+        
+        if (selectedCandidate) {
+            this.log(`✅ FINAL SELECTION: index ${selectedCandidate.index}, value ${selectedCandidate.bestValue.value} (${selectedCandidate.bestValue.source})`);
+            return selectedCandidate.input;
+        }
+        
+        this.log('❌ Selection failed despite valid candidates', 'error');
+        return null;
+    }
+
+    performEnhancedWeightedSelection(validCandidates, settingsMin, settingsMax) {
+        if (validCandidates.length === 1) {
+            this.log(`🎯 Single candidate selection`);
+            return validCandidates[0];
+        }
+        
+        // Parse user-defined weights from config (JSON format for dynamic ranges)
+        let userWeights = {};
+        try {
+            const userWeightsStr = this.currentFormData.likertWeights || '{"5":50,"4":40,"3":7,"2":2,"1":1}';
+            
+            // Handle both old format (CSV) and new format (JSON)
+            if (userWeightsStr.includes(',')) {
+                // Legacy CSV format "50,40,7,2,1" - assume 5,4,3,2,1 order
+                const weights = userWeightsStr.split(',').map(w => parseFloat(w.trim()) || 1);
+                weights.forEach((weight, index) => {
+                    userWeights[5 - index] = weight; // Map to 5,4,3,2,1
+                });
+            } else {
+                // New JSON format {"5":50, "4":40, "3":7, ...}
+                userWeights = JSON.parse(userWeightsStr);
+            }
+        } catch (e) {
+            this.log(`⚠️ Error parsing weights, using defaults: ${e.message}`);
+            userWeights = {5: 50, 4: 40, 3: 7, 2: 2, 1: 1};
+        }
+        
+        this.log(`📊 User-defined Likert weights: ${JSON.stringify(userWeights)}`);
+        
+        const weights = validCandidates.map((candidate, index) => {
+            const value = candidate.bestValue.value;
+            const confidence = candidate.bestValue.confidence;
+            
+            // Get user-defined weight for this exact rating value
+            const userWeight = userWeights[value] || userWeights[value.toString()] || 1;
+            
+            // Base weight from user configuration
+            let weight = userWeight;
+            
+            // Confidence bonus (small modifier to maintain user's preference)
+            weight *= (0.8 + confidence * 0.2);
+            
+            // Small bonus for values in user's preferred range
+            if (value >= settingsMin && value <= settingsMax) {
+                weight *= 1.1; // 10% bonus for being in range
+            }
+            
+            this.log(`📊 Weight calculation for value ${value}:`);
+            this.log(`   - User weight for rating ${value}: ${userWeight}`);
+            this.log(`   - Confidence modifier: ${confidence}`);
+            this.log(`   - Range bonus: ${value >= settingsMin && value <= settingsMax ? '1.1x' : '1.0x'}`);
+            this.log(`   - Final weight: ${weight.toFixed(3)}`);
+            
+            return weight;
+        });
+        
+        // Weighted random selection
+        const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+        let random = Math.random() * totalWeight;
+        
+        this.log(`🎲 Weighted selection: total=${totalWeight.toFixed(3)}, random=${random.toFixed(3)}`);
+        
+        for (let i = weights.length - 1; i >= 0; i--) {
+            random -= weights[i];
+            if (random <= 0) {
+                const selected = validCandidates[i];
+                this.log(`🎯 Selected candidate ${i}: value ${selected.bestValue.value} (weight: ${weights[i].toFixed(3)}/${totalWeight.toFixed(3)})`);
+                return selected;
+            }
+        }
+        
+        // Fallback to highest value
+        const fallback = validCandidates[validCandidates.length - 1];
+        this.log(`🎯 Fallback to highest: value ${fallback.bestValue.value}`);
+        return fallback;
+    }
+
+    async selectRadioInputComprehensive(selectedInput) {
+        // Comprehensive radio input selection like console script
+        let attempts = 0;
+        let success = false;
+        const maxAttempts = 3;
+        
+        while (!success && attempts < maxAttempts) {
+            attempts++;
+            this.log(`🔄 Attempt ${attempts}/${maxAttempts} for radio input`);
+            
+            try {
+                // Scroll into view
+                selectedInput.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await this.sleep(200);
+                
+                // Method 1: Direct radio input manipulation
+                this.log(`   Method 1: Direct radio input`);
+                selectedInput.checked = true;
+                selectedInput.dispatchEvent(new Event('change', { bubbles: true }));
+                selectedInput.dispatchEvent(new Event('click', { bubbles: true }));
+                
+                await this.sleep(200);
+                
+                // Verify selection
+                if (selectedInput.checked) {
+                    this.log(`✅ Method 1 successful: direct input manipulation`);
+                    success = true;
+                } else {
+                    this.log(`   Method 1 failed, trying alternatives...`);
+                    
+                    // Method 2: Click the label wrapper
+                    const label = selectedInput.closest('label');
+                    if (label) {
+                        this.log(`   Method 2: Label click`);
+                        label.click();
+                        await this.sleep(200);
+                        if (selectedInput.checked) {
+                            this.log(`✅ Method 2 successful: label click`);
+                            success = true;
+                        }
+                    }
+                    
+                    // Method 3: Click the span wrapper
+                    if (!success) {
+                        const span = selectedInput.closest('[data-automation-id="radio"]');
+                        if (span) {
+                            this.log(`   Method 3: Span wrapper click`);
+                            span.click();
+                            await this.sleep(200);
+                            if (selectedInput.checked) {
+                                this.log(`✅ Method 3 successful: span click`);
+                                success = true;
+                            }
+                        }
+                    }
+                    
+                    // Method 4: Click the table cell
+                    if (!success) {
+                        const td = selectedInput.closest('td');
+                        if (td) {
+                            this.log(`   Method 4: Table cell click`);
+                            td.click();
+                            await this.sleep(200);
+                            if (selectedInput.checked) {
+                                this.log(`✅ Method 4 successful: cell click`);
+                                success = true;
+                            }
+                        }
+                    }
+                    
+                    // Method 5: MouseEvent simulation
+                    if (!success) {
+                        this.log(`   Method 5: MouseEvent simulation`);
+                        const rect = selectedInput.getBoundingClientRect();
+                        selectedInput.dispatchEvent(new MouseEvent('mousedown', {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: rect.left + rect.width / 2,
+                            clientY: rect.top + rect.height / 2
+                        }));
+                        await this.sleep(20);
+                        selectedInput.dispatchEvent(new MouseEvent('mouseup', {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: rect.left + rect.width / 2,
+                            clientY: rect.top + rect.height / 2
+                        }));
+                        selectedInput.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: rect.left + rect.width / 2,
+                            clientY: rect.top + rect.height / 2
+                        }));
+                        await this.sleep(200);
+                        if (selectedInput.checked) {
+                            this.log(`✅ Method 5 successful: MouseEvent`);
+                            success = true;
+                        }
+                    }
+                }
+                
+                if (!success && attempts < maxAttempts) {
+                    this.log(`⚠️ All methods failed in attempt ${attempts}, retrying...`);
+                    await this.sleep(500);
+                }
+                
+            } catch (error) {
+                this.log(`❌ Error in attempt ${attempts}: ${error.message}`, 'error');
+            }
+        }
+        
+        return success;
+    }
+
+    isElementVisible(element) {
+        if (!element) return false;
+        
+        try {
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            
+            // Standard visibility check
+            const isStandardVisible = rect.width > 0 && 
+                                    rect.height > 0 && 
+                                    style.display !== 'none' && 
+                                    style.visibility !== 'hidden' && 
+                                    style.opacity !== '0';
+            
+            // For radio inputs, they might be hidden but their parent/label is visible
+            if (!isStandardVisible && element.type === 'radio') {
+                // Check if parent container is visible
+                const parent = element.closest('label') || 
+                              element.closest('[role="radio"]') || 
+                              element.parentElement;
+                
+                if (parent) {
+                    const parentRect = parent.getBoundingClientRect();
+                    const parentStyle = window.getComputedStyle(parent);
+                    
+                    const isParentVisible = parentRect.width > 0 && 
+                                          parentRect.height > 0 && 
+                                          parentStyle.display !== 'none' && 
+                                          parentStyle.visibility !== 'hidden' && 
+                                          parentStyle.opacity !== '0';
+                    
+                    if (isParentVisible) {
+                        this.log(`🔍 Radio input hidden but parent is visible: ${this.getInputLabel(element)}`);
+                        return true;
+                    }
+                }
+            }
+            
+            if (!isStandardVisible && this.debug) {
+                // Debug info for invisible elements
+                this.log(`❌ Element not visible: rect=${rect.width}x${rect.height}, display=${style.display}, visibility=${style.visibility}, opacity=${style.opacity}`, 'warning');
+            }
+            
+            return isStandardVisible;
+        } catch (error) {
+            this.log(`❌ Error checking element visibility: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    performComprehensiveValidation() {
+        this.log('🧪 Performing comprehensive form validation...');
+        
+        const validationResult = {
+            isValid: true,
+            errors: [],
+            warnings: [],
+            successMessage: '',
+            details: {
+                totalQuestions: 0,
+                answeredQuestions: 0,
+                requiredQuestions: 0,
+                answeredRequiredQuestions: 0,
+                validationErrors: 0,
+                criticalErrors: 0
+            }
+        };
+        
+        try {
+            // Step 1: Check for visible validation errors
+            const validationErrors = this.checkValidationErrors();
+            validationResult.details.validationErrors = validationErrors.length;
+            
+            if (validationErrors.length > 0) {
+                validationResult.errors.push(...validationErrors);
+                validationResult.isValid = false;
+            }
+            
+            // Step 2: Check form completeness
+            const completenessCheck = this.checkFormCompleteness();
+            validationResult.details = { ...validationResult.details, ...completenessCheck.details };
+            
+            if (!completenessCheck.isComplete) {
+                validationResult.errors.push(...completenessCheck.errors);
+                validationResult.warnings.push(...completenessCheck.warnings);
+                
+                // Only mark as invalid if there are critical completion issues
+                if (completenessCheck.hasCriticalIssues) {
+                    validationResult.isValid = false;
+                }
+            }
+            
+            // Step 3: Check for form processing state
+            const processingCheck = this.checkFormProcessingState();
+            if (!processingCheck.isReady) {
+                validationResult.warnings.push(processingCheck.message);
+            }
+            
+            // Step 4: Final validation assessment
+            const criticalErrors = validationResult.errors.filter(error => 
+                this.isCriticalValidationError(error)
+            );
+            validationResult.details.criticalErrors = criticalErrors.length;
+            
+            if (criticalErrors.length > 0) {
+                validationResult.isValid = false;
+            }
+            
+            // Generate success message
+            if (validationResult.isValid) {
+                validationResult.successMessage = `Form ready for submission (${validationResult.details.answeredQuestions}/${validationResult.details.totalQuestions} questions answered, ${validationResult.details.answeredRequiredQuestions}/${validationResult.details.requiredQuestions} required answered)`;
+            }
+            
+            this.log(`📊 Validation summary:`);
+            this.log(`   - Total questions: ${validationResult.details.totalQuestions}`);
+            this.log(`   - Answered: ${validationResult.details.answeredQuestions}`);
+            this.log(`   - Required: ${validationResult.details.requiredQuestions}`);
+            this.log(`   - Required answered: ${validationResult.details.answeredRequiredQuestions}`);
+            this.log(`   - Validation errors: ${validationResult.details.validationErrors}`);
+            this.log(`   - Critical errors: ${validationResult.details.criticalErrors}`);
+            this.log(`   - Overall valid: ${validationResult.isValid}`);
+            
+            return validationResult;
+            
+        } catch (error) {
+            this.log(`❌ Error during comprehensive validation: ${error.message}`, 'error');
+            return {
+                isValid: false,
+                errors: [`Validation process failed: ${error.message}`],
+                warnings: [],
+                successMessage: '',
+                details: validationResult.details
+            };
+        }
+    }
+
+    checkValidationErrors() {
+        // Enhanced validation error detection
+        const errorSelectors = [
+            '[role="alert"]',
+            '.error-message',
+            '.validation-error',
+            '[data-automation-id*="error"]',
+            '[data-automation-id*="Error"]',
+            '.field-error',
+            '.form-error',
+            '[aria-invalid="true"]',
+            '.required-field-missing',
+            '.ms-TextField-errorMessage',
+            '.error-text',
+            '.validation-message',
+            '[data-testid*="error"]'
+        ];
+        
+        const errors = [];
+        
+        errorSelectors.forEach(selector => {
+            const errorElements = document.querySelectorAll(selector);
+            errorElements.forEach(element => {
+                if (this.isElementVisible(element) && element.textContent.trim()) {
+                    const errorText = element.textContent.trim();
+                    if (errorText.length > 0 && errorText.length < 500) {
+                        errors.push(errorText);
+                    }
+                }
+            });
+        });
+        
+        // Check for red styling (common for errors)
+        const redElements = document.querySelectorAll('[style*="color: red"], [style*="color:red"], .error, .invalid');
+        redElements.forEach(element => {
+            const style = window.getComputedStyle(element);
+            const isRedText = style.color.includes('rgb(255, 0, 0)') || 
+                             style.color.includes('red') ||
+                             style.color.includes('rgb(220, 53, 69)'); // Bootstrap danger color
+            
+            if (isRedText && this.isElementVisible(element)) {
+                const text = element.textContent.trim();
+                if (text && text.length > 0 && text.length < 300 && !errors.includes(text)) {
+                    errors.push(text);
+                }
+            }
+        });
+        
+        // Remove duplicates and filter out false positives
+        const uniqueErrors = [...new Set(errors)].filter(error => {
+            const lowerError = error.toLowerCase();
+            // Filter out common false positives
+            return !lowerError.includes('optional') && 
+                   !lowerError.includes('help') &&
+                   !lowerError.includes('info') &&
+                   lowerError.length > 3;
+        });
+        
+        return uniqueErrors;
+    }
+
+    checkFormCompleteness() {
+        const result = {
+            isComplete: true,
+            hasCriticalIssues: false,
+            errors: [],
+            warnings: [],
+            details: {
+                totalQuestions: 0,
+                answeredQuestions: 0,
+                requiredQuestions: 0,
+                answeredRequiredQuestions: 0
+            }
+        };
+        
+        try {
+            // Get all visible questions on the page
+            const questionElements = document.querySelectorAll(`
+                [data-automation-id="questionItem"],
+                .office-form-question,
+                [data-automation-id="question"],
+                [role="radiogroup"]
+            `);
+            
+            result.details.totalQuestions = questionElements.length;
+            
+            for (const questionElement of questionElements) {
+                if (!this.isElementVisible(questionElement)) continue;
+                
+                const isRequired = this.isQuestionRequired(questionElement);
+                if (isRequired) {
+                    result.details.requiredQuestions++;
+                }
+                
+                const isAnswered = this.isQuestionAnswered(questionElement);
+                if (isAnswered) {
+                    result.details.answeredQuestions++;
+                    if (isRequired) {
+                        result.details.answeredRequiredQuestions++;
+                    }
+                }
+                
+                // Check for critical issues
+                if (isRequired && !isAnswered) {
+                    const questionText = this.getQuestionText(questionElement);
+                    const errorMsg = `Required question not answered: ${questionText?.substring(0, 50) || 'Unknown question'}`;
+                    result.errors.push(errorMsg);
+                    result.hasCriticalIssues = true;
+                    result.isComplete = false;
+                }
+            }
+            
+            // Check overall completion rate
+            const completionRate = result.details.totalQuestions > 0 ? 
+                result.details.answeredQuestions / result.details.totalQuestions : 1;
+            
+            if (completionRate < 0.5) {
+                result.warnings.push(`Low completion rate: ${Math.round(completionRate * 100)}% of questions answered`);
+            }
+            
+        } catch (error) {
+            this.log(`❌ Error checking form completeness: ${error.message}`, 'error');
+            result.errors.push(`Completeness check failed: ${error.message}`);
+            result.isComplete = false;
+        }
+        
+        return result;
+    }
+
+    isQuestionAnswered(questionElement) {
+        try {
+            // Check different types of form controls
+            const radioInputs = questionElement.querySelectorAll('input[type="radio"]');
+            if (radioInputs.length > 0) {
+                return Array.from(radioInputs).some(input => input.checked);
+            }
+            
+            const checkboxInputs = questionElement.querySelectorAll('input[type="checkbox"]');
+            if (checkboxInputs.length > 0) {
+                return Array.from(checkboxInputs).some(input => input.checked);
+            }
+            
+            const textInputs = questionElement.querySelectorAll('input[type="text"], textarea');
+            if (textInputs.length > 0) {
+                return Array.from(textInputs).some(input => input.value.trim().length > 0);
+            }
+            
+            const selectInputs = questionElement.querySelectorAll('select');
+            if (selectInputs.length > 0) {
+                return Array.from(selectInputs).some(select => select.value && select.value !== '');
+            }
+            
+            const sliders = questionElement.querySelectorAll('[role="slider"]');
+            if (sliders.length > 0) {
+                return Array.from(sliders).some(slider => 
+                    slider.getAttribute('aria-valuenow') !== null
+                );
+            }
+            
+            return false;
+        } catch (error) {
+            this.log(`❌ Error checking if question is answered: ${error.message}`, 'error');
+            return false; // Assume not answered if we can't determine
+        }
+    }
+
+    checkFormProcessingState() {
+        try {
+            // Check if form is in processing state (loading, submitting, etc.)
+            const processingIndicators = [
+                '.loading',
+                '.spinner',
+                '[data-loading="true"]',
+                '.submitting',
+                '[disabled="true"]'
+            ];
+            
+            for (const selector of processingIndicators) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0 && Array.from(elements).some(el => this.isElementVisible(el))) {
+                    return {
+                        isReady: false,
+                        message: 'Form appears to be in processing state'
+                    };
+                }
+            }
+            
+            return {
+                isReady: true,
+                message: 'Form is ready for interaction'
+            };
+        } catch (error) {
+            return {
+                isReady: true,
+                message: 'Could not determine processing state'
+            };
+        }
+    }
+
+    isCriticalValidationError(error) {
+        const criticalKeywords = [
+            'required',
+            'mandatory',
+            'must',
+            'cannot be empty',
+            'field is empty',
+            'please select',
+            'please enter',
+            'invalid format',
+            'not valid'
+        ];
+        
+        const lowerError = error.toLowerCase();
+        return criticalKeywords.some(keyword => lowerError.includes(keyword));
+    }
+
+    async submitForm() {
+        this.log('📤 Looking for submit button...');
+        
+        const submitSelectors = [
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button[data-automation-id="submitButton"]',
+            'button[data-automation-id="questionnaireSubmitButton"]',
+            '.submit-button',
+            '[role="button"][aria-label*="Submit"]',
+            '[role="button"][aria-label*="Gửi"]',
+            '[data-automation-id*="submit"]',
+            '[data-automation-id*="Submit"]'
+        ];
+        
+        // Also search by text content
+        const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"], div[role="button"]');
+        
+        let submitButton = null;
+        
+        this.log(`🔍 Found ${allButtons.length} potential button elements`);
+        
+        // Try selectors first
+        for (const selector of submitSelectors) {
+            submitButton = document.querySelector(selector);
+            if (submitButton && this.isElementVisible(submitButton)) {
+                this.log(`🎯 Found submit button via selector: ${selector}`);
+                break;
+            }
+        }
+        
+        // If no button found via selectors, search by text
+        if (!submitButton) {
+            const submitTexts = ['submit', 'gửi', 'send', 'continue', 'tiếp tục', 'hoàn thành'];
+            
+            for (const button of allButtons) {
+                const text = button.textContent.toLowerCase().trim();
+                this.log(`🔍 Checking button: "${text}"`);
+                
+                if (submitTexts.some(submitText => text.includes(submitText)) && 
+                    this.isElementVisible(button)) {
+                    submitButton = button;
+                    this.log(`🎯 Found submit button via text search: "${text}"`);
+                    break;
+                }
+            }
+        }
+        
+        if (!submitButton) {
+            throw new Error('Không tìm thấy nút Submit');
+        }
+        
+        try {
+            this.log('🚀 Clicking submit button...');
+            
+            submitButton.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.sleep(500);
+            
+            submitButton.click();
+            await this.sleep(2000);
+            
+            this.log('✅ Form submitted successfully');
+            return true;
+            
+        } catch (error) {
+            this.log(`❌ Error submitting form: ${error.message}`, 'error');
+            throw error;
+        }
+    }
+
+    async waitForSuccessPage() {
+        this.log('⏳ Waiting for form submission success page...');
+        
+        const maxWait = 10000; // 10 seconds max wait
+        const startTime = Date.now();
+        
+        while (Date.now() - startTime < maxWait) {
+            // Look for success indicators
+            const successIndicators = [
+                'span[data-automation-id="submitAnother"]',
+                '[data-automation-id*="success"]',
+                '[data-automation-id*="Success"]'
+            ];
+            
+            // Check for standard success selectors
+            for (const selector of successIndicators) {
+                try {
+                    const element = document.querySelector(selector);
+                    if (element && this.isElementVisible(element)) {
+                        this.log('✅ Success page loaded, submit another button available');
+                        return true;
+                    }
+                } catch (error) {
+                    this.log(`⚠️ Error checking selector ${selector}: ${error.message}`, 'warning');
+                }
+            }
+            
+            // Check for success text content (replacement for :contains() which is not supported)
+            try {
+                const successTexts = [
+                    "Your response has been recorded",
+                    "Your response was submitted",
+                    "Phản hồi của bạn đã được ghi lại",
+                    "Submit another response",
+                    "Gửi phản hồi khác"
+                ];
+                
+                for (const successText of successTexts) {
+                    // Check if any element contains the success text
+                    const allElements = document.querySelectorAll('div, span, p, h1, h2, h3');
+                    for (const element of allElements) {
+                        if (element.textContent && element.textContent.includes(successText) && this.isElementVisible(element)) {
+                            this.log(`✅ Success page detected via text: "${successText}"`);
+                            return true;
+                        }
+                    }
+                }
+            } catch (error) {
+                this.log(`⚠️ Error checking success text content: ${error.message}`, 'warning');
+            }
+            
+            // Also check if the form questions are no longer visible (indicating success page)
+            const questions = document.querySelectorAll('[data-automation-id="questionItem"]');
+            if (questions.length === 0) {
+                this.log('✅ Form questions disappeared, likely on success page');
+                await this.sleep(1000); // Extra wait for success page elements to fully load
+                return true;
+            }
+            
+            await this.sleep(500);
+        }
+        
+        this.log('⚠️ Timed out waiting for success page', 'warning');
+        return false;
+    }
+
+    async waitForFormToLoad() {
+        this.log('⏳ Waiting for new form to load...');
+        
+        const maxWait = 10000; // 10 seconds max wait
+        const startTime = Date.now();
+        
+        while (Date.now() - startTime < maxWait) {
+            // Look for form elements that indicate a new form has loaded
+            const formIndicators = [
+                '[data-automation-id="questionItem"]',
+                '[data-automation-id="question"]',
+                'div[role="radiogroup"]',
+                'input[type="radio"]',
+                'div[class*="question"]'
+            ];
+            
+            for (const selector of formIndicators) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                    // Make sure at least one element is visible
+                    const visibleElements = Array.from(elements).filter(el => this.isElementVisible(el));
+                    if (visibleElements.length > 0) {
+                        this.log(`✅ New form loaded with ${visibleElements.length} form elements`);
+                        await this.sleep(1000); // Extra time for all elements to fully load
+                        return true;
+                    }
+                }
+            }
+            
+            await this.sleep(500);
+        }
+        
+        this.log('⚠️ Timed out waiting for new form to load', 'warning');
+        return false;
+    }
+
+    async clickSubmitAnother() {
+        this.log('🔍 Looking for "Submit another response" button on success page...');
+        
+        // Update submit count when we reach the success page
+        this.updateSubmitCount(true);
+        
+        // Wait for the success page to load after form submission
+        await this.waitForSuccessPage();
+        
+        // Enhanced detection - check multiple approaches
+        const detectionStrategies = [
+            {
+                name: 'Exact automation-id',
+                selector: 'span[data-automation-id="submitAnother"]',
+                getClickable: (element) => element.closest('div[role="link"], a, button') || element
+            },
+            {
+                name: 'Text-based search',
+                selector: null,
+                getClickable: (element) => {
+                    // Search for elements containing "Submit another" text
+                    const candidates = document.querySelectorAll('div, span, a, button');
+                    for (const candidate of candidates) {
+                        const text = candidate.textContent?.trim().toLowerCase();
+                        if (text && (text.includes('submit another') || text.includes('gửi phản hồi khác'))) {
+                            return candidate.closest('div[role="link"], a, button') || candidate;
+                        }
+                    }
+                    return null;
+                }
+            },
+            {
+                name: 'Role-based search',
+                selector: 'div[role="link"][tabindex="0"]',
+                getClickable: (element) => {
+                    const text = element.textContent?.trim().toLowerCase();
+                    return (text && (text.includes('submit') || text.includes('another') || text.includes('gửi'))) ? element : null;
+                }
+            },
+            {
+                name: 'Class pattern search',
+                selector: 'div[class*="-hw-"]',
+                getClickable: (element) => {
+                    const hasSubmitText = element.textContent?.toLowerCase().includes('submit');
+                    const hasTabindex = element.hasAttribute('tabindex');
+                    const hasRole = element.getAttribute('role') === 'link';
+                    return (hasSubmitText && (hasTabindex || hasRole)) ? element : null;
+                }
+            }
+        ];
+        
+        for (const strategy of detectionStrategies) {
+            try {
+                this.log(`🔍 Trying strategy: ${strategy.name}`);
+                
+                let candidates = [];
+                
+                if (strategy.selector) {
+                    candidates = Array.from(document.querySelectorAll(strategy.selector));
+                    this.log(`   Found ${candidates.length} elements with selector: ${strategy.selector}`);
+                } else {
+                    // Special handling for text-based search
+                    const element = strategy.getClickable();
+                    if (element) candidates = [element];
+                }
+                
+                for (const candidate of candidates) {
+                    const clickableElement = strategy.getClickable(candidate);
+                    
+                    if (clickableElement && this.isElementVisible(clickableElement)) {
+                        this.log(`✅ Found clickable "Submit another" element via ${strategy.name}`);
+                        this.log(`   Element: ${clickableElement.tagName}.${clickableElement.className}`);
+                        this.log(`   Text: "${clickableElement.textContent?.trim()}"`);
+                        
+                        const success = await this.performSubmitAnotherClick(clickableElement);
+                        if (success) return success;
+                    }
+                }
+            } catch (error) {
+                this.log(`⚠️ Error in strategy ${strategy.name}: ${error.message}`, 'warning');
+            }
+        }
+        
+        // If all strategies failed, provide debug information
+        this.log('❌ Could not find "Submit another response" button using any strategy');
+        this.logSubmitAnotherDebugInfo();
+        
+        return { success: false, message: 'Submit another response button not found' };
+    }
+
+    logSubmitAnotherDebugInfo() {
+        this.log('🔍 === SUBMIT ANOTHER DEBUG INFO ===');
+        
+        // Log all divs with role="link"
+            this.log(`🔍 Trying selector: ${selector}`);
+            const elements = document.querySelectorAll(selector);
+            this.log(`🔍 Found ${elements.length} elements with selector: ${selector}`);
+            
+            for (const element of elements) {
+                if (!this.isElementVisible(element)) {
+                    this.log(`⚠️ Element not visible, skipping: ${element.tagName}.${element.className}`);
+                    continue;
+                }
+                
+                this.log(`🔍 Found visible element: ${element.tagName}.${element.className}`);
+                
+                // If it's the span, get the parent div
+                let clickableElement = element;
+                if (element.tagName === 'SPAN' && element.getAttribute('data-automation-id') === 'submitAnother') {
+                    // Get the parent div with role="link"
+                    clickableElement = element.closest('div[role="link"][tabindex="0"]') || 
+                                     element.closest('div[tabindex="0"][role="link"]') || 
+                                     element.closest('div[class*="-hw-"]') ||
+                                     element.parentElement;
+                    
+                    this.log(`🎯 Span found, using parent: ${clickableElement?.tagName}.${clickableElement?.className}`);
+                }
+                
+                // Validate the clickable element
+                if (clickableElement && this.isElementVisible(clickableElement)) {
+                    // Additional validation for the exact structure
+                    const hasCorrectStructure = 
+                        clickableElement.getAttribute('role') === 'link' &&
+                        clickableElement.getAttribute('tabindex') === '0' &&
+                        clickableElement.querySelector('span[data-automation-id="submitAnother"]');
+                    
+                    if (hasCorrectStructure) {
+                        this.log(`✅ Found submit another button with correct structure via selector: ${selector}`);
+                        this.log(`🎯 Element: ${clickableElement.tagName}, class: ${clickableElement.className}, role: ${clickableElement.getAttribute('role')}`);
+                        return await this.performSubmitAnotherClick(clickableElement);
+                    } else {
+                        this.log(`⚠️ Element found but structure doesn't match expected pattern`);
+                    }
+                }
+            }
+        }
+        
+        // Try text-based search with enhanced detection
+        this.log('🔍 Trying text-based search for submit another button...');
+        const allInteractiveElements = document.querySelectorAll('div, span, button, a, [role="link"], [tabindex="0"]');
+        
+        for (const text of textSearches) {
+            this.log(`🔍 Searching for text: "${text}"`);
+            
+            const matchingElements = Array.from(allInteractiveElements).filter(el => {
+                const elementText = el.textContent?.toLowerCase().trim();
+                const searchText = text.toLowerCase();
+                return elementText && (
+                    elementText.includes(searchText) || 
+                    elementText === searchText ||
+                    elementText.replace(/\s+/g, ' ') === searchText
+                );
+            });
+            
+            this.log(`🔍 Found ${matchingElements.length} elements matching "${text}"`);
+            
+            for (const element of matchingElements) {
+                if (!this.isElementVisible(element)) {
+                    this.log(`⚠️ Element not visible: ${element.textContent?.substring(0, 30)}`);
+                    continue;
+                }
+                
+                let clickableElement = element;
+                
+                // Find the best clickable element
+                if (!this.isElementClickable(element)) {
+                    // Try to find clickable parent
+                    const potentialParents = [
+                        element.closest('div[role="link"]'),
+                        element.closest('div[tabindex="0"]'),
+                        element.closest('[role="link"]'),
+                        element.closest('[tabindex="0"]'),
+                        element.closest('div[class*="clickable"]'),
+                        element.closest('div[class*="button"]'),
+                        element.parentElement
+                    ].filter(Boolean);
+                    
+                    clickableElement = potentialParents.find(parent => 
+                        this.isElementClickable(parent) && this.isElementVisible(parent)
+                    ) || element;
+                }
+                
+                if (clickableElement && this.isElementVisible(clickableElement)) {
+                    this.log(`✅ Found submit another button via text: "${text}" on element: ${clickableElement.tagName}`);
+                    this.log(`🎯 Element details: classes="${clickableElement.className}", role="${clickableElement.getAttribute('role')}", tabindex="${clickableElement.getAttribute('tabindex')}"`);
+                    return await this.performSubmitAnotherClick(clickableElement);
+                }
+            }
+        }
+        
+        // Debug: Log page structure to understand what's available
+        this.log('🔍 Submit another response button not found, analyzing page structure...');
+        this.logSubmitAnotherDebugInfo();
+        
+        this.log('❌ Submit another response button not found', 'warning');
+        return false;
+    }
+
+    logSubmitAnotherDebugInfo() {
+        this.log('🔍 === SUBMIT ANOTHER DEBUG INFO ===');
+        
+        // Log all divs with role="link"
+        const linkDivs = document.querySelectorAll('div[role="link"]');
+        this.log(`📋 Found ${linkDivs.length} divs with role="link"`);
+        
+        linkDivs.forEach((div, index) => {
+            const hasTabindex = div.hasAttribute('tabindex');
+            const tabindexValue = div.getAttribute('tabindex');
+            const className = div.className;
+            const textContent = div.textContent?.trim().substring(0, 50);
+            const hasSubmitSpan = div.querySelector('span[data-automation-id="submitAnother"]');
+            
+            this.log(`  [${index}] Class: "${className}", tabindex: "${tabindexValue}", hasSubmitSpan: ${!!hasSubmitSpan}`);
+            this.log(`       Text: "${textContent}"`);
+        });
+        
+        // Log all spans with data-automation-id
+        const automationSpans = document.querySelectorAll('span[data-automation-id]');
+        this.log(`📋 Found ${automationSpans.length} spans with data-automation-id`);
+        
+        automationSpans.forEach((span, index) => {
+            const automationId = span.getAttribute('data-automation-id');
+            const textContent = span.textContent?.trim();
+            const parentInfo = `${span.parentElement?.tagName}.${span.parentElement?.className}`;
+            
+            this.log(`  [${index}] automation-id: "${automationId}", text: "${textContent}", parent: ${parentInfo}`);
+        });
+        
+        // Log all elements containing "submit" or "response" text
+        const allElements = document.querySelectorAll('*');
+        const submitElements = Array.from(allElements).filter(el => {
+            const text = el.textContent?.toLowerCase() || '';
+            return text.includes('submit') && text.includes('response') && text.length < 100;
+        });
+        
+        this.log(`📋 Found ${submitElements.length} elements containing "submit" and "response"`);
+        submitElements.forEach((el, index) => {
+            this.log(`  [${index}] ${el.tagName}.${el.className}: "${el.textContent?.trim()}"`);
+        });
+        
+        this.log('🔍 === END DEBUG INFO ===');
+    }
+
+    // Multi-page form navigation functions
+    async proceedToNext() {
+        this.log('🔍 Looking for navigation buttons (Next/Submit)...');
+        
+        // Priority order: Next button first, then Submit button
+        const buttonSelectors = [
+            { selector: '[data-automation-id="nextButton"]', type: 'next' },
+            { selector: 'button[aria-label*="Next"]', type: 'next' },
+            { selector: 'button[aria-label*="Tiếp"]', type: 'next' },
+            { selector: '[data-automation-id="submitButton"]', type: 'submit' },
+            { selector: 'button[type="submit"]', type: 'submit' },
+            { selector: 'button[aria-label*="Submit"]', type: 'submit' },
+            { selector: 'button[aria-label*="Gửi"]', type: 'submit' },
+            { selector: 'button[data-automation-id="questionnaireSubmitButton"]', type: 'submit' }
+        ];
+        
+        // Also search by text content
+        const textSearches = [
+            { text: 'Next', type: 'next' },
+            { text: 'Tiếp', type: 'next' },
+            { text: 'Continue', type: 'next' },
+            { text: 'Tiếp tục', type: 'next' },
+            { text: 'Submit', type: 'submit' },
+            { text: 'Gửi', type: 'submit' },
+            { text: 'Hoàn thành', type: 'submit' },
+            { text: 'Send', type: 'submit' }
+        ];
+        
+        // First try selector-based search
+        for (const { selector, type } of buttonSelectors) {
+            const button = document.querySelector(selector);
+            if (button && this.isElementClickable(button)) {
+                this.log(`🎯 Found ${type} button via selector: "${selector}" - "${button.textContent.trim()}"`);
+                return await this.clickNavigationButton(button, type);
+            }
+        }
+        
+        // Then try text-based search on all buttons
+        const allButtons = document.querySelectorAll('button, input[type="submit"], [role="button"]');
+        for (const { text, type } of textSearches) {
+            const button = Array.from(allButtons).find(btn => 
+                btn.textContent.toLowerCase().includes(text.toLowerCase()) && 
+                this.isElementClickable(btn)
+            );
+            
+            if (button) {
+                this.log(`🎯 Found ${type} button via text: "${text}" - "${button.textContent.trim()}"`);
+                return await this.clickNavigationButton(button, type);
+            }
+        }
+        
+        this.log('❌ No navigation buttons found - form may be complete or have issues', 'warning');
+        return { success: false, type: 'none' };
+    }
+
+    async clickNavigationButton(button, type) {
+        try {
+            this.log(`🎯 Clicking ${type} button: "${button.textContent.trim()}"`);
+            
+            // Scroll to button and wait
+            button.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await this.sleep(500);
+            
+            // Click the button
+            const clickSuccess = await this.performClick(button);
+            if (!clickSuccess) {
+                this.log(`❌ Failed to click ${type} button`, 'error');
+                return { success: false, type: type };
+            }
+            
+            if (type === 'next') {
+                this.log('📄 Navigating to next page...');
+                
+                // Wait for page transition
+                await this.sleep(1500);
+                
+                // Wait for new page to load properly
+                const pageLoaded = await this.waitForFormToLoad();
+                if (!pageLoaded) {
+                    this.log('⚠️ New page may not have loaded properly', 'warning');
+                }
+                
+                return { success: true, type: 'next' };
+                
+            } else if (type === 'submit') {
+                this.log('🎉 Form submitted successfully!', 'success');
+                
+                // Wait for submission to complete
+                await this.sleep(2000);
+                
+                return { success: true, type: 'submit' };
+            }
+            
+        } catch (error) {
+            this.log(`❌ Error clicking ${type} button: ${error.message}`, 'error');
+            return { success: false, type: type, error: error.message };
+        }
+        
+        return { success: false, type: type };
+    }
+
+    async resetPageState() {
+        this.log('🔄 Resetting state for new page...');
+        
+        // Reset processed questions tracking
+        this.processedQuestions = new Set();
+        
+        // Reset any other page-specific state if needed
+        this.log('✅ Page state reset complete');
+    }
+
+    async performClick(element) {
+        if (!element) return false;
+        
+        try {
+            this.log(`🖱️ Attempting to click element: ${element.tagName}.${element.className}`);
+            
+            // Multiple click methods to ensure success
+            let success = false;
+            
+            // Method 1: Direct click
+            try {
+                element.click();
+                await this.sleep(100);
+                success = true;
+                this.log('✅ Direct click successful');
+            } catch (e) {
+                this.log(`⚠️ Direct click failed: ${e.message}`);
+            }
+            
+            // Method 2: MouseEvent simulation if direct click failed
+            if (!success) {
+                try {
+                    const rect = element.getBoundingClientRect();
+                    const centerX = rect.left + rect.width / 2;
+                    const centerY = rect.top + rect.height / 2;
+                    
+                    const mouseEvents = ['mousedown', 'mouseup', 'click'];
+                    for (const eventType of mouseEvents) {
+                        element.dispatchEvent(new MouseEvent(eventType, {
+                            bubbles: true,
+                            cancelable: true,
+                            clientX: centerX,
+                            clientY: centerY
+                        }));
+                        await this.sleep(20);
+                    }
+                    
+                    success = true;
+                    this.log('✅ MouseEvent simulation successful');
+                } catch (e) {
+                    this.log(`⚠️ MouseEvent simulation failed: ${e.message}`);
+                }
+            }
+            
+            // Method 3: Focus and keyboard if mouse events failed
+            if (!success) {
+                try {
+                    element.focus();
+                    await this.sleep(50);
+                    
+                    const keyEvents = ['keydown', 'keypress', 'keyup'];
+                    for (const eventType of keyEvents) {
+                        element.dispatchEvent(new KeyboardEvent(eventType, {
+                            key: 'Enter',
+                            bubbles: true,
+                            cancelable: true
+                        }));
+                        await this.sleep(20);
+                    }
+                    
+                    success = true;
+                    this.log('✅ Keyboard interaction successful');
+                } catch (e) {
+                    this.log(`⚠️ Keyboard interaction failed: ${e.message}`);
+                }
+            }
+            
+            return success;
+            
+        } catch (error) {
+            this.log(`❌ Error performing click: ${error.message}`, 'error');
+            return false;
+        }
+    }
+
+    isElementClickable(element) {
+        if (!element) return false;
+        
+        const style = window.getComputedStyle(element);
+        return style.pointerEvents !== 'none' && 
+               !element.disabled && 
+               this.isElementVisible(element);
+    }
+
+    async performSubmitAnotherClick(element) {
+        this.log(`🔄 Attempting to click submit another button: ${element.tagName}.${element.className}`);
+        
+        // Store the element info for debugging
+        const elementInfo = {
+            tagName: element.tagName,
+            className: element.className,
+            id: element.id,
+            role: element.getAttribute('role'),
+            tabindex: element.getAttribute('tabindex'),
+            text: element.textContent?.trim(),
+            href: element.getAttribute('href'),
+            onClick: element.getAttribute('onclick')
+        };
+        
+        this.log(`📋 Element info: ${JSON.stringify(elementInfo)}`);
+        
+        // Ensure element is ready for interaction
+        element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await this.sleep(800);
+        
+        // Check if element is still visible and clickable
+        if (!this.isElementVisible(element)) {
+            this.log('❌ Element became invisible after scroll');
+            return false;
+        }
+        
+        // Method 1: Focus and click
+        try {
+            this.log('🔄 Method 1: Focus and click');
+            
+            // Focus the element first
+            if (element.focus) {
+                element.focus();
+                await this.sleep(200);
+            }
+            
+            element.click();
+            await this.sleep(2000); // Longer wait for navigation
+            
+            // Check if we're back to the form (indicating success)
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful - back to form (Method 1)');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 1 failed: ${error.message}`);
+        }
+        
+        // Method 2: Comprehensive click simulation
+        try {
+            this.log('🔄 Method 2: Comprehensive click simulation');
+            const rect = element.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            
+            // Simulate full click sequence
+            const mouseDownEvent = new MouseEvent('mousedown', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
+            });
+            const mouseUpEvent = new MouseEvent('mouseup', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
+            });
+            const clickEvent = new MouseEvent('click', {
+                view: window, bubbles: true, cancelable: true,
+                clientX: centerX, clientY: centerY
+            });
+            
+            element.dispatchEvent(mouseDownEvent);
+            await this.sleep(50);
+            element.dispatchEvent(mouseUpEvent);
+            await this.sleep(50);
+            element.dispatchEvent(clickEvent);
+            await this.sleep(2000);
+            
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful via comprehensive click (Method 2)');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 2 failed: ${error.message}`);
+        }
+        
+        // Method 3: Enhanced keyboard activation
+        try {
+            this.log('🔄 Method 3: Enhanced keyboard activation');
+            element.focus();
+            await this.sleep(300);
+            
+            // Try Enter key
+            const enterEvent = new KeyboardEvent('keydown', {
+                key: 'Enter', code: 'Enter', keyCode: 13,
+                bubbles: true, cancelable: true
+            });
+            element.dispatchEvent(enterEvent);
+            await this.sleep(500);
+            
+            // Also try Space key (for some elements)
+            const spaceEvent = new KeyboardEvent('keydown', {
+                key: ' ', code: 'Space', keyCode: 32,
+                bubbles: true, cancelable: true
+            });
+            element.dispatchEvent(spaceEvent);
+            await this.sleep(2000);
+            
+            if (this.isBackToForm()) {
+                this.log('✅ Submit another successful via enhanced keyboard (Method 3)');
+                return true;
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 3 failed: ${error.message}`);
+        }
+        
+        // Method 4: Try clicking child elements
+        try {
+            this.log('🔄 Method 4: Looking for clickable child elements');
+            
+            // Try child span with data-automation-id
+            const childSpan = element.querySelector('span[data-automation-id="submitAnother"]');
+            if (childSpan) {
+                this.log('🎯 Found child span element, clicking it');
+                childSpan.click();
+                await this.sleep(2000);
+                
+                if (this.isBackToForm()) {
+                    this.log('✅ Submit another successful via child span (Method 4)');
+                    return true;
+                }
+            }
+            
+            // Try any clickable child element
+            const clickableChildren = element.querySelectorAll('span, div, a');
+            for (const child of clickableChildren) {
+                if (child.textContent?.toLowerCase().includes('submit') || 
+                    child.textContent?.toLowerCase().includes('gửi')) {
+                    this.log(`🎯 Trying clickable child: ${child.tagName}`);
+                    child.click();
+                    await this.sleep(2000);
+                    
+                    if (this.isBackToForm()) {
+                        this.log('✅ Submit another successful via clickable child (Method 4)');
+                        return true;
+                    }
+                }
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 4 failed: ${error.message}`);
+        }
+        
+        // Method 5: Try URL navigation if href exists
+        try {
+            this.log('🔄 Method 5: URL navigation');
+            const href = element.getAttribute('href');
+            if (href && href !== '#') {
+                this.log(`🎯 Found href: ${href}, navigating...`);
+                window.location.href = href;
+                await this.sleep(3000);
+                
+                if (this.isBackToForm()) {
+                    this.log('✅ Submit another successful via URL navigation (Method 5)');
+                    return true;
+                }
+            }
+        } catch (error) {
+            this.log(`⚠️ Method 5 failed: ${error.message}`);
+        }
+        
+        this.log('❌ All submit another click methods failed');
+        return false;
+    }
+    
+    isBackToForm() {
+        this.log('🔍 Checking if back to form...');
+        
+        // Check if we're back to the form by looking for form elements
+        const formIndicators = [
+            '[data-automation-id="questionItem"]',
+            '[data-automation-id="questionContainer"]',
+            'input[type="radio"]',
+            'input[type="checkbox"]',
+            'input[type="text"]',
+            'textarea',
+            'select',
+            '.office-form-question',
+            '[role="radiogroup"]',
+            '[data-automation-id="nextButton"]',
+            '[data-automation-id="submitButton"]'
+        ];
+        
+        let foundIndicators = 0;
+        for (const selector of formIndicators) {
+            const elements = document.querySelectorAll(selector);
+            if (elements.length > 0) {
+                foundIndicators++;
+                this.log(`✅ Found form indicator: ${selector} (${elements.length} elements)`);
+            }
+        }
+        
+        this.log(`📊 Found ${foundIndicators} form indicators out of ${formIndicators.length}`);
+        
+        // Need at least 2 indicators to be confident we're back to form
+        if (foundIndicators >= 2) {
+            this.log('✅ Confirmed: Back to form page');
+            return true;
+        }
+        
+        // Also check if we're no longer on a "thank you" or completion page
+        const completionIndicators = [
+            'Your response has been recorded',
+            'Thank you',
+            'Cảm ơn bạn',
+            'Đã ghi lại phản hồi',
+            'response has been submitted',
+            'submitAnother' // If we still see submit another, we're not back to form yet
+        ];
+        
+        const pageText = document.body.textContent?.toLowerCase() || '';
+        const hasCompletionText = completionIndicators.some(text => {
+            const found = pageText.includes(text.toLowerCase());
+            if (found) {
+                this.log(`⚠️ Still on completion page - found text: "${text}"`);
+            }
+            return found;
+        });
+        
+        const isBackToForm = !hasCompletionText && foundIndicators >= 2;
+        this.log(`📋 Final determination: ${isBackToForm ? 'Back to form' : 'Still on completion page'}`);
+        
+        return isBackToForm;
+    }
+
+    logPageStructure() {
+        this.log('🔍 Analyzing page structure for debugging...');
+        
+        // Check for common form elements
+        const elements = [
+            { selector: '[data-automation-id="questionItem"]', name: 'Question Items' },
+            { selector: '[role="radiogroup"]', name: 'Radio Groups' },
+            { selector: 'input[type="radio"]', name: 'Radio Inputs' },
+            { selector: 'input[type="checkbox"]', name: 'Checkboxes' },
+            { selector: 'input[type="text"]', name: 'Text Inputs' },
+            { selector: 'textarea', name: 'Text Areas' },
+            { selector: 'select', name: 'Select Dropdowns' },
+            { selector: '.office-form-question', name: 'Office Form Questions' },
+            { selector: '.question-title-container', name: 'Question Titles' },
+            { selector: '[data-automation-id="choiceGroupView"]', name: 'Choice Groups' }
+        ];
+        
+        elements.forEach(({ selector, name }) => {
+            const found = document.querySelectorAll(selector);
+            this.log(`📊 ${name}: ${found.length} found`);
+        });
+        
+        // Log page content hints
+        const bodyText = document.body.textContent.substring(0, 500);
+        this.log(`📄 Page content preview: ${bodyText}...`);
+    }
+
+    // System integration test method
+    async performSystemIntegrationTest() {
+        this.log('🧪 SYSTEM INTEGRATION TEST - Starting comprehensive validation...');
+        
+        const testResults = {
+            timestamp: new Date().toISOString(),
+            overallStatus: 'PASS',
+            tests: [],
+            summary: {
+                passed: 0,
+                failed: 0,
+                warnings: 0
+            }
+        };
+        
+        try {
+            // Test 1: Page Detection
+            const pageTest = this.testPageDetection();
+            testResults.tests.push(pageTest);
+            
+            // Test 2: Question Detection
+            const questionTest = await this.testQuestionDetection();
+            testResults.tests.push(questionTest);
+            
+            // Test 3: Settings Validation
+            const settingsTest = this.testSettingsValidation();
+            testResults.tests.push(settingsTest);
+            
+            // Test 4: Fixed Answers Logic
+            const fixedAnswersTest = this.testFixedAnswersLogic();
+            testResults.tests.push(fixedAnswersTest);
+            
+            // Test 5: Rating Selection Logic
+            const ratingTest = this.testRatingSelectionLogic();
+            testResults.tests.push(ratingTest);
+            
+            // Test 6: Form Validation
+            const validationTest = this.testFormValidation();
+            testResults.tests.push(validationTest);
+            
+            // Calculate summary
+            testResults.tests.forEach(test => {
+                if (test.status === 'PASS') {
+                    testResults.summary.passed++;
+                } else if (test.status === 'FAIL') {
+                    testResults.summary.failed++;
+                    testResults.overallStatus = 'FAIL';
+                } else if (test.status === 'WARNING') {
+                    testResults.summary.warnings++;
+                }
+            });
+            
+            // Log results
+            this.log(`🧪 SYSTEM TEST RESULTS:`);
+            this.log(`   Overall Status: ${testResults.overallStatus}`);
+            this.log(`   Passed: ${testResults.summary.passed}`);
+            this.log(`   Failed: ${testResults.summary.failed}`);
+            this.log(`   Warnings: ${testResults.summary.warnings}`);
+            
+            testResults.tests.forEach(test => {
+                const icon = test.status === 'PASS' ? '✅' : test.status === 'FAIL' ? '❌' : '⚠️';
+                this.log(`   ${icon} ${test.name}: ${test.message}`);
+                
+                if (test.details && test.details.length > 0) {
+                    test.details.forEach(detail => {
+                        this.log(`      - ${detail}`);
+                    });
+                }
+            });
+            
+            return testResults;
+            
+        } catch (error) {
+            this.log(`❌ System integration test failed: ${error.message}`, 'error');
+            testResults.overallStatus = 'FAIL';
+            testResults.tests.push({
+                name: 'System Test Execution',
+                status: 'FAIL',
+                message: `Test execution failed: ${error.message}`,
+                details: []
+            });
+            
+            return testResults;
+        }
+    }
+
+    testPageDetection() {
+        const test = {
+            name: 'Page Detection',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const isValid = this.isValidFormsPage();
+            const currentUrl = window.location.href;
+            
+            if (isValid) {
+                test.message = 'Valid Microsoft Forms page detected';
+                test.details.push(`URL: ${currentUrl}`);
+            } else {
+                test.status = 'FAIL';
+                test.message = 'Invalid or unsupported page';
+                test.details.push(`URL: ${currentUrl}`);
+                test.details.push('Page does not appear to be a Microsoft Forms page');
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Page detection failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    async testQuestionDetection() {
+        const test = {
+            name: 'Question Detection',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const questions = await this.getAllQuestions();
+            
+            if (questions.length > 0) {
+                test.message = `Successfully detected ${questions.length} questions`;
+                test.details.push(`Question types: ${[...new Set(questions.map(q => q.type))].join(', ')}`);
+                test.details.push(`Required questions: ${questions.filter(q => q.isRequired).length}`);
+            } else {
+                test.status = 'WARNING';
+                test.message = 'No questions detected on current page';
+                test.details.push('Page may not be fully loaded or may not contain form questions');
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Question detection failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testSettingsValidation() {
+        const test = {
+            name: 'Settings Validation',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            if (!this.currentFormData) {
+                test.status = 'FAIL';
+                test.message = 'No form data/settings available';
+                return test;
+            }
+            
+            // Check rating settings
+            const ratingMin = parseInt(this.currentFormData.ratingMin);
+            const ratingMax = parseInt(this.currentFormData.ratingMax);
+            
+            if (isNaN(ratingMin) || isNaN(ratingMax) || ratingMin > ratingMax) {
+                test.status = 'WARNING';
+                test.message = 'Invalid rating range settings';
+                test.details.push(`Rating range: ${this.currentFormData.ratingMin}-${this.currentFormData.ratingMax}`);
+            } else {
+                test.message = 'Settings validation passed';
+                test.details.push(`Rating range: ${ratingMin}-${ratingMax}`);
+            }
+            
+            // Check special questions
+            if (this.currentFormData.specialQuestions && this.currentFormData.specialQuestions.length > 0) {
+                test.details.push(`Fixed answers configured: ${this.currentFormData.specialQuestions.length}`);
+            }
+            
+            // Check auto-submit setting
+            test.details.push(`Auto-submit: ${this.currentFormData.autoSubmit ? 'enabled' : 'disabled'}`);
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Settings validation failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testFixedAnswersLogic() {
+        const test = {
+            name: 'Fixed Answers Logic',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            if (!this.currentFormData.specialQuestions || this.currentFormData.specialQuestions.length === 0) {
+                test.status = 'WARNING';
+                test.message = 'No fixed answers configured';
+                return test;
+            }
+            
+            // Test matching logic with sample data
+            const sampleQuestions = [
+                'What is your favorite color?',
+                'Rate your experience',
+                'How satisfied are you?'
+            ];
+            
+            let matchesFound = 0;
+            
+            sampleQuestions.forEach(questionText => {
+                const match = this.findBestSpecialQuestionMatch(questionText, this.currentFormData.specialQuestions);
+                if (match) {
+                    matchesFound++;
+                    test.details.push(`Sample match: "${questionText}" → "${match.specialQuestion.answer}"`);
+                }
+            });
+            
+            test.message = `Fixed answers logic functional (${matchesFound}/${sampleQuestions.length} sample matches)`;
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Fixed answers test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testRatingSelectionLogic() {
+        const test = {
+            name: 'Rating Selection Logic',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            // Create mock rating inputs to test selection logic
+            const mockInputs = [];
+            for (let i = 1; i <= 5; i++) {
+                const mockInput = {
+                    getAttribute: (attr) => attr === 'aria-label' ? i.toString() : null,
+                    value: i.toString(),
+                    id: `rating_${i}`,
+                    name: 'rating'
+                };
+                mockInputs.push(mockInput);
+            }
+            
+            const settingsMin = parseInt(this.currentFormData.ratingMin) || 4;
+            const settingsMax = parseInt(this.currentFormData.ratingMax) || 5;
+            
+            const selectedInput = this.selectRatingFromInputsPositional(mockInputs, settingsMin, settingsMax);
+            
+            if (selectedInput) {
+                const selectedValue = parseInt(selectedInput.getAttribute('aria-label'));
+                const isInRange = selectedValue >= settingsMin && selectedValue <= settingsMax;
+                
+                if (isInRange) {
+                    test.message = `Rating selection working correctly (selected: ${selectedValue})`;
+                    test.details.push(`User range: ${settingsMin}-${settingsMax}`);
+                    test.details.push(`Selected value: ${selectedValue}`);
+                } else {
+                    test.status = 'WARNING';
+                    test.message = `Rating selection outside user range (selected: ${selectedValue})`;
+                }
+            } else {
+                test.status = 'WARNING';
+                test.message = 'No rating option selected (may be intentional for strict compliance)';
+            }
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Rating selection test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    testFormValidation() {
+        const test = {
+            name: 'Form Validation',
+            status: 'PASS',
+            message: '',
+            details: []
+        };
+        
+        try {
+            const validationResult = this.performComprehensiveValidation();
+            
+            if (validationResult.isValid) {
+                test.message = 'Form validation system working correctly';
+                test.details.push(validationResult.successMessage);
+            } else {
+                test.status = 'WARNING';
+                test.message = `Form validation detected issues (${validationResult.errors.length} errors)`;
+                test.details.push(...validationResult.errors.slice(0, 3)); // Show first 3 errors
+            }
+            
+            test.details.push(`Validation errors detected: ${validationResult.details.validationErrors}`);
+            test.details.push(`Critical errors: ${validationResult.details.criticalErrors}`);
+            
+        } catch (error) {
+            test.status = 'FAIL';
+            test.message = `Form validation test failed: ${error.message}`;
+        }
+        
+        return test;
+    }
+
+    // Performance optimization: Cache frequently used DOM queries
+    getCachedQuestionElements() {
+        if (!this.elementCache) {
+            this.elementCache = new Map();
+        }
+        
+        // Clear old cache entries (older than 5 seconds)
+        const now = Date.now();
+        for (const [key, data] of this.elementCache.entries()) {
+            if (now - data.timestamp > 5000) {
+                this.elementCache.delete(key);
+            }
+        }
+        
+        return {
+            questionItems: document.querySelectorAll('[data-automation-id="questionItem"]'),
+            questionContainers: document.querySelectorAll('[data-automation-id="questionContainer"]'),
+            likertContainers: document.querySelectorAll('[data-automation-id*="likert"], [data-automation-id*="matrix"]'),
+            radioGroups: document.querySelectorAll('[role="radiogroup"]'),
+            textInputs: document.querySelectorAll('input[type="text"], textarea'),
+            checkboxes: document.querySelectorAll('input[type="checkbox"]'),
+            selectElements: document.querySelectorAll('select')
+        };
+    }
+
+    // Smart wait for dynamic content
+    async waitForQuestionsToLoad(timeout = 3000) {
+        const startTime = Date.now();
+        let lastCount = 0;
+        let stableCount = 0;
+        
+        while (Date.now() - startTime < timeout) {
+            const elements = this.getCachedQuestionElements();
+            const currentCount = elements.questionItems.length + elements.questionContainers.length;
+            
+            if (currentCount === lastCount) {
+                stableCount++;
+                if (stableCount >= 3) { // Stable for 3 checks
+                    this.log(`✅ Questions loaded and stable: ${currentCount} elements`);
+                    return true;
+                }
+            } else {
+                stableCount = 0;
+                lastCount = currentCount;
+            }
+            
+            await this.sleep(100);
+        }
+        
+        this.log(`⚠️ Questions may still be loading after ${timeout}ms`);
+        return false;
+    }
+
+    // Helper method to ensure input is an Array
+    ensureArray(input) {
+        if (!input) return [];
+        if (Array.isArray(input)) return input;
+        if (input.length !== undefined) return Array.from(input); // NodeList, HTMLCollection, etc.
+        return [input]; // Single element
+    }
+
+    // Advanced element comparison to avoid duplicates
+    areElementsSimilar(element1, element2, threshold = 0.8) {
+        if (element1 === element2) return true;
+        
+        const getElementFingerprint = (el) => {
+            const rect = el.getBoundingClientRect();
+            const attrs = Array.from(el.attributes).map(attr => `${attr.name}:${attr.value}`).join('|');
+            const children = Array.from(el.children).map(child => child.tagName).join(',');
+            
+            return {
+                tagName: el.tagName,
+                rect: { top: Math.round(rect.top), left: Math.round(rect.left), width: Math.round(rect.width), height: Math.round(rect.height) },
+                attributes: attrs,
+                children: children,
+                textContent: el.textContent?.trim().substring(0, 50) || ''
+            };
+        };
+        
+        const fp1 = getElementFingerprint(element1);
+        const fp2 = getElementFingerprint(element2);
+        
+        let similarity = 0;
+        let checks = 0;
+        
+        // Tag name check
+        if (fp1.tagName === fp2.tagName) similarity += 0.2;
+        checks++;
+        
+        // Position similarity
+        const rectDiff = Math.abs(fp1.rect.top - fp2.rect.top) + Math.abs(fp1.rect.left - fp2.rect.left);
+        if (rectDiff < 10) similarity += 0.3;
+        checks++;
+        
+        // Size similarity
+        const sizeDiff = Math.abs(fp1.rect.width - fp2.rect.width) + Math.abs(fp1.rect.height - fp2.rect.height);
+        if (sizeDiff < 20) similarity += 0.2;
+        checks++;
+        
+        // Content similarity
+        if (fp1.textContent && fp2.textContent) {
+            const textSimilarity = this.calculateTextSimilarity(fp1.textContent, fp2.textContent);
+            similarity += textSimilarity * 0.3;
+            checks++;
+        }
+        
+        return (similarity / checks) >= threshold;
+    }
+}
+
+// Initialize the content script
+console.log('🔍 QuickFill: Initializing on URL:', window.location.href);
+window.quickFillFormsV2Instance = new QuickFillFormsV2();
+console.log('🚀 QuickFill: Instance created and stored');
+
+}
