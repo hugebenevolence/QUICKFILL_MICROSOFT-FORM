@@ -203,26 +203,39 @@ class QuickFillFormsV2 {
             while (cycleCount < effectiveMaxCycles && this.isRunning) {
                 this.log(`🔄 Starting fill cycle ${cycleCount + 1}/${effectiveMaxCycles}`);
                 
-                const fillResult = await this.fillCurrentForm();
-                if (!fillResult) {
-                    throw new Error('Form filling failed');
-                }
-                
-                cycleCount++;
-                
-                // If this is not the last cycle, try to submit another response
-                if (cycleCount < effectiveMaxCycles && this.currentFormData.autoSubmit) {
-                    this.log('🔄 Attempting to submit another response...');
-                    const submitAnotherResult = await this.clickSubmitAnother();
-                    
-                    if (!submitAnotherResult) {
-                        this.log('⚠️ Could not click "Submit another response", stopping cycles');
-                        break;
+                try {
+                    const fillResult = await this.fillCurrentForm();
+                    if (!fillResult) {
+                        throw new Error('Form filling failed');
                     }
                     
-                    // Wait for new form to load after clicking submit another
-                    this.log('⏳ Waiting for new form to load...');
-                    await this.waitForFormToLoad();
+                    cycleCount++;
+                    
+                    // If this is not the last cycle, try to submit another response
+                    if (cycleCount < effectiveMaxCycles && this.currentFormData.autoSubmit) {
+                        this.log('🔄 Attempting to submit another response...');
+                        const submitAnotherResult = await this.clickSubmitAnother();
+                        
+                        if (!submitAnotherResult) {
+                            this.log('⚠️ Could not click "Submit another response", stopping cycles');
+                            break;
+                        }
+                        
+                        // Wait for new form to load after clicking submit another
+                        this.log('⏳ Waiting for new form to load...');
+                        await this.waitForFormToLoad();
+                    }
+                } catch (fillError) {
+                    this.log(`❌ Error in fill cycle ${cycleCount + 1}: ${fillError.message}`, 'error');
+                    
+                    // Decide whether to continue or break based on error severity
+                    if (fillError.message.includes('Not a valid Microsoft Forms page') || 
+                        fillError.message.includes('No questions found')) {
+                        throw fillError; // Critical error, stop completely
+                    }
+                    
+                    // Non-critical error, continue with next cycle but log it
+                    this.log('🔄 Continuing to next cycle despite error', 'warning');
                 }
             }
             
@@ -270,7 +283,11 @@ class QuickFillFormsV2 {
         } finally {
             this.isRunning = false;
             // Save final state
-            await this.saveSessionToStorage();
+            try {
+                await this.saveSessionToStorage();
+            } catch (saveError) {
+                this.log(`❌ Error saving final session: ${saveError.message}`, 'error');
+            }
         }
     }
 
@@ -299,9 +316,16 @@ class QuickFillFormsV2 {
             this.log('⏳ Waiting for form to load...');
             await this.waitForFormLoad();
             
-            // Get all questions
+            // Get all questions with validation
             this.log('🔍 Searching for questions...');
-            const questions = await this.getAllQuestions();
+            let questions;
+            try {
+                questions = await this.getAllQuestions();
+            } catch (questionError) {
+                this.log(`❌ Error getting questions: ${questionError.message}`, 'error');
+                throw new Error(`Failed to detect form questions: ${questionError.message}`);
+            }
+            
             this.log(`📋 Found ${questions.length} questions to process`);
             
             if (questions.length === 0) {
@@ -310,15 +334,21 @@ class QuickFillFormsV2 {
                 throw new Error('No questions found on the form. Check if the page has loaded correctly.');
             }
             
-            // Fill each question
+            // Fill each question with error handling
             for (let i = 0; i < questions.length; i++) {
                 if (!this.isRunning) break;
                 
                 const question = questions[i];
                 this.log(`📝 Processing question ${i + 1}/${questions.length}: ${question.type}`);
                 
-                await this.fillQuestion(question);
-                await this.delay(300, 800); // Random delay between questions
+                try {
+                    await this.fillQuestion(question);
+                    await this.delay(300, 800); // Random delay between questions
+                } catch (questionError) {
+                    this.log(`❌ Error filling question ${i + 1}: ${questionError.message}`, 'error');
+                    // Continue with other questions instead of failing completely
+                    continue;
+                }
             }
             
             // After filling all questions on current page, check for navigation
@@ -348,7 +378,14 @@ class QuickFillFormsV2 {
                     // Enhanced comprehensive validation check before submit
                     await this.sleep(1000); // Give form time to update and process
                     
-                    const validationResult = this.performComprehensiveValidation();
+                    let validationResult;
+                    try {
+                        validationResult = this.performComprehensiveValidation();
+                    } catch (validationError) {
+                        this.log(`❌ Validation check failed: ${validationError.message}`, 'error');
+                        // Continue with submit attempt
+                        validationResult = { isValid: true, errors: [], warnings: [] };
+                    }
                     
                     if (!validationResult.isValid) {
                         this.log(`⚠️ Form validation issues detected (${validationResult.errors.length} issues):`, 'warning');
@@ -1029,7 +1066,14 @@ class QuickFillFormsV2 {
     identifyQuestionType(element) {
         // Matrix/Grid questions (Likert scale tables) - Be more precise to avoid false positives
         
-        // Method 1: Check for Microsoft Forms specific Likert structure (most reliable)
+        // Method 1: Check for Microsoft Forms specific Likert structure (most reliable) - Updated for new structure
+        const likertSubQuestions = element.querySelectorAll('[data-automation-id="likerSubQuestion"]');
+        if (likertSubQuestions.length > 0) {
+            this.log(`🔍 Matrix question detected via likerSubQuestion: ${likertSubQuestions.length} sub-questions`);
+            return 'matrix';
+        }
+        
+        // Method 1b: Legacy check for old Likert structure
         const likertStatements = element.querySelectorAll('[data-automation-id="likerStatementTd"]');
         if (likertStatements.length > 0) {
             this.log(`🔍 Matrix question detected via likertStatements: ${likertStatements.length}`);
@@ -1821,11 +1865,18 @@ class QuickFillFormsV2 {
 
     async selectRadioChoice(input) {
         try {
+            if (!input) {
+                this.log('❌ Input element is null/undefined', 'error');
+                return false;
+            }
+
             this.log(`🎯 Selecting radio choice: "${this.getInputLabel(input)}"`);
             
             // Scroll into view
-            input.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await this.sleep(300);
+            if (input.scrollIntoView) {
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await this.sleep(300);
+            }
             
             // Try multiple click methods
             const clickMethods = [
@@ -1953,7 +2004,7 @@ class QuickFillFormsV2 {
         const placeholder = input.placeholder || input.getAttribute('aria-label') || '';
         
         // Generate appropriate text based on input type or placeholder
-        if (placeholder.toLowerCase().includes('email')) {
+        if (placeholder.toLowerCase().includes('email') || placeholder.toLowerCase().includes('e-mail')) {
             return `user${Math.floor(Math.random() * 1000)}@example.com`;
         } else if (placeholder.toLowerCase().includes('phone')) {
             return `09${Math.floor(Math.random() * 100000000).toString().padStart(8, '0')}`;
@@ -1967,29 +2018,52 @@ class QuickFillFormsV2 {
 
     async fillTextInput(input, text) {
         try {
+            if (!input) {
+                this.log('❌ Input element is null/undefined', 'error');
+                return false;
+            }
+
             this.log(`📝 Filling text input with: "${text}"`);
             
-            input.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await this.sleep(200);
+            // Check if input is disabled or readonly
+            if (input.disabled || input.readOnly) {
+                this.log('⚠️ Input is disabled or readonly, skipping', 'warning');
+                return false;
+            }
+
+            if (input.scrollIntoView) {
+                input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                await this.sleep(200);
+            }
             
-            input.focus();
+            if (input.focus) {
+                input.focus();
+            }
             input.value = '';
             await this.sleep(100);
             
             // Type character by character for more natural behavior
             for (const char of text) {
                 input.value += char;
-                input.dispatchEvent(new Event('input', { bubbles: true }));
+                if (input.dispatchEvent) {
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                }
                 await this.sleep(50);
             }
             
-            input.dispatchEvent(new Event('change', { bubbles: true }));
-            input.blur();
+            if (input.dispatchEvent) {
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (input.blur) {
+                input.blur();
+            }
             
             this.log('✅ Text input filled successfully');
+            return true;
             
         } catch (error) {
             this.log(`❌ Error filling text input: ${error.message}`, 'error');
+            return false;
         }
     }
 
@@ -2115,7 +2189,17 @@ class QuickFillFormsV2 {
     }
 
     async fillMatrixQuestion(question) {
-        // Find Likert table rows using multiple selectors like console script
+        this.log(`📊 Processing Matrix/Likert question...`);
+        
+        // Method 1: Check for new Microsoft Forms Likert structure with likerSubQuestion
+        let likertSubQuestions = question.element.querySelectorAll('[data-automation-id="likerSubQuestion"]');
+        
+        if (likertSubQuestions.length > 0) {
+            this.log(`📋 Found ${likertSubQuestions.length} Likert sub-questions using new structure`);
+            return await this.fillLikertSubQuestions(likertSubQuestions);
+        }
+        
+        // Method 2: Legacy - Find Likert table rows using multiple selectors like console script
         let matrixRows = question.element.querySelectorAll('tr[role="radiogroup"]');
         
         if (matrixRows.length === 0) {
@@ -2150,8 +2234,77 @@ class QuickFillFormsV2 {
             return;
         }
         
-        this.log(`📊 Found ${matrixRows.length} Likert scale rows to fill`);
+        this.log(`📊 Found ${matrixRows.length} Likert scale rows to fill (legacy structure)`);
+        return await this.fillLikertTableRows(matrixRows);
+    }
+    
+    async fillLikertSubQuestions(likertSubQuestions) {
+        const settingsMin = this.currentFormData.ratingMin || 4;
+        const settingsMax = this.currentFormData.ratingMax || 5;
         
+        this.log(`📊 Likert sub-questions settings - Min: ${settingsMin}, Max: ${settingsMax}`);
+        
+        for (const subQuestion of likertSubQuestions) {
+            try {
+                // Get the question text from the sub-question
+                const questionTextElement = subQuestion.querySelector('.text-format-content, [class*="-qh-"]');
+                const questionText = questionTextElement ? questionTextElement.textContent.trim() : 'Unknown question';
+                
+                this.log(`📋 Processing Likert sub-question: ${questionText.substring(0, 80)}...`);
+                
+                // Find all radio inputs in this sub-question
+                let radioInputs = subQuestion.querySelectorAll('input[type="radio"]');
+                
+                if (radioInputs.length === 0) {
+                    this.log(`⚠️ No radio inputs found in sub-question`, 'warning');
+                    continue;
+                }
+                
+                this.log(`Found ${radioInputs.length} rating options (1-${radioInputs.length})`);
+                
+                // Debug: Log all radio inputs found
+                Array.from(radioInputs).forEach((radio, index) => {
+                    const value = radio.value;
+                    const automationValue = radio.getAttribute('data-automation-value');
+                    const ariaLabel = radio.getAttribute('aria-label');
+                    const name = radio.name;
+                    this.log(`   Radio ${index + 1}: value="${value}", automation-value="${automationValue}", aria-label="${ariaLabel}", name="${name}"`);
+                });
+                
+                // Use position-based selection
+                const selectedInput = this.selectRatingFromInputsPositional(this.ensureArray(radioInputs), settingsMin, settingsMax);
+                
+                if (selectedInput) {
+                    // Get display information
+                    const ariaLabel = selectedInput.getAttribute('aria-label');
+                    const value = selectedInput.value;
+                    const automationValue = selectedInput.getAttribute('data-automation-value');
+                    const displayValue = ariaLabel || value || automationValue || 'unknown';
+                    const actualPosition = ariaLabel ? `position ${ariaLabel}` : `value ${value}`;
+                    
+                    this.log(`🎯 Selecting rating: ${displayValue} (${actualPosition}) for "${questionText.substring(0, 40)}..."`);
+                    
+                    // Use comprehensive click method
+                    const success = await this.selectRadioInputComprehensive(selectedInput);
+                    
+                    if (success) {
+                        this.log(`✅ Successfully selected: ${displayValue}`);
+                    } else {
+                        this.log(`❌ Failed to select: ${displayValue}`, 'error');
+                    }
+                } else {
+                    this.log(`❌ No suitable rating found for sub-question`, 'error');
+                }
+                
+                await this.delay(200, 400);
+                
+            } catch (error) {
+                this.log(`❌ Error processing Likert sub-question: ${error.message}`, 'error');
+            }
+        }
+    }
+    
+    async fillLikertTableRows(matrixRows) {
         // Get rating settings from popup
         const settingsMin = this.currentFormData.ratingMin || 4;
         const settingsMax = this.currentFormData.ratingMax || 5;
@@ -2552,46 +2705,51 @@ class QuickFillFormsV2 {
     isElementVisible(element) {
         if (!element) return false;
         
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        
-        // Standard visibility check
-        const isStandardVisible = rect.width > 0 && 
-                                rect.height > 0 && 
-                                style.display !== 'none' && 
-                                style.visibility !== 'hidden' && 
-                                style.opacity !== '0';
-        
-        // For radio inputs, they might be hidden but their parent/label is visible
-        if (!isStandardVisible && element.type === 'radio') {
-            // Check if parent container is visible
-            const parent = element.closest('label') || 
-                          element.closest('[role="radio"]') || 
-                          element.parentElement;
+        try {
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
             
-            if (parent) {
-                const parentRect = parent.getBoundingClientRect();
-                const parentStyle = window.getComputedStyle(parent);
+            // Standard visibility check
+            const isStandardVisible = rect.width > 0 && 
+                                    rect.height > 0 && 
+                                    style.display !== 'none' && 
+                                    style.visibility !== 'hidden' && 
+                                    style.opacity !== '0';
+            
+            // For radio inputs, they might be hidden but their parent/label is visible
+            if (!isStandardVisible && element.type === 'radio') {
+                // Check if parent container is visible
+                const parent = element.closest('label') || 
+                              element.closest('[role="radio"]') || 
+                              element.parentElement;
                 
-                const isParentVisible = parentRect.width > 0 && 
-                                      parentRect.height > 0 && 
-                                      parentStyle.display !== 'none' && 
-                                      parentStyle.visibility !== 'hidden' && 
-                                      parentStyle.opacity !== '0';
-                
-                if (isParentVisible) {
-                    this.log(`🔍 Radio input hidden but parent is visible: ${this.getInputLabel(element)}`);
-                    return true;
+                if (parent) {
+                    const parentRect = parent.getBoundingClientRect();
+                    const parentStyle = window.getComputedStyle(parent);
+                    
+                    const isParentVisible = parentRect.width > 0 && 
+                                          parentRect.height > 0 && 
+                                          parentStyle.display !== 'none' && 
+                                          parentStyle.visibility !== 'hidden' && 
+                                          parentStyle.opacity !== '0';
+                    
+                    if (isParentVisible) {
+                        this.log(`🔍 Radio input hidden but parent is visible: ${this.getInputLabel(element)}`);
+                        return true;
+                    }
                 }
             }
+            
+            if (!isStandardVisible && this.debug) {
+                // Debug info for invisible elements
+                this.log(`❌ Element not visible: rect=${rect.width}x${rect.height}, display=${style.display}, visibility=${style.visibility}, opacity=${style.opacity}`, 'warning');
+            }
+            
+            return isStandardVisible;
+        } catch (error) {
+            this.log(`❌ Error checking element visibility: ${error.message}`, 'error');
+            return false;
         }
-        
-        if (!isStandardVisible) {
-            // Debug info for invisible elements
-            this.log(`❌ Element not visible: rect=${rect.width}x${rect.height}, display=${style.display}, visibility=${style.visibility}, opacity=${style.opacity}`, 'warning');
-        }
-        
-        return isStandardVisible;
     }
 
     performComprehensiveValidation() {

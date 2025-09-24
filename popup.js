@@ -258,6 +258,12 @@ class PopupController {
     }
 
     async startFilling() {
+        // Prevent multiple starts
+        if (this.isRunning) {
+            this.showStatus('Extension đang chạy, vui lòng chờ...', 'warning');
+            return;
+        }
+
         try {
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             
@@ -389,7 +395,7 @@ class PopupController {
                     console.log('Attempting to inject content script...');
                     chrome.scripting.executeScript({
                         target: { tabId: tab.id },
-                        files: ['content.js']
+                        files: ['content-v2.1.js']
                     }, () => {
                         if (chrome.runtime.lastError) {
                             console.error('❌ Injection failed:', chrome.runtime.lastError.message);
@@ -523,7 +529,13 @@ class PopupController {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 const response = await new Promise((resolve, reject) => {
+                    // Add timeout mechanism
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Message timeout after 5 seconds'));
+                    }, 5000);
+                    
                     chrome.tabs.sendMessage(tabId, message, (response) => {
+                        clearTimeout(timeout);
                         if (chrome.runtime.lastError) {
                             reject(new Error(chrome.runtime.lastError.message));
                         } else {
@@ -540,7 +552,7 @@ class PopupController {
                     throw error;
                 }
                 
-                // Wait before retry
+                // Wait before retry with exponential backoff
                 await new Promise(resolve => setTimeout(resolve, 500 * attempt));
             }
         }
@@ -793,15 +805,21 @@ class PopupController {
     }
 
     updateRealTimeStats() {
-        // Only update if session is active
-        if (this.sessionStartTime && (this.currentStats.isRunning || this.currentStats.submitCount > 0)) {
-            const currentDuration = Date.now() - this.sessionStartTime;
-            
-            // Update duration in real-time
-            this.currentStats.sessionDuration = currentDuration;
-            
-            // Update the duration display only (don't trigger full statistics update)
-            this.updateDurationDisplay(currentDuration);
+        try {
+            // Only update if session is active
+            if (this.sessionStartTime && (this.currentStats.isRunning || this.currentStats.submitCount > 0)) {
+                const currentDuration = Date.now() - this.sessionStartTime;
+                
+                // Update duration in real-time
+                this.currentStats.sessionDuration = currentDuration;
+                
+                // Update the duration display only (don't trigger full statistics update)
+                this.updateDurationDisplay(currentDuration);
+            }
+        } catch (error) {
+            console.error('❌ Error in real-time stats update:', error);
+            // Stop interval on error to prevent further issues
+            this.stopRealTimeUpdates();
         }
     }
 
@@ -1094,12 +1112,20 @@ document.addEventListener('DOMContentLoaded', () => {
 // Cleanup when popup is closed
 window.addEventListener('beforeunload', () => {
     if (window.popupController) {
+        // Cleanup intervals
         window.popupController.stopRealTimeUpdates();
+        
+        // Remove event listeners to prevent memory leaks
+        if (window.popupController.messageListener) {
+            chrome.runtime.onMessage.removeListener(window.popupController.messageListener);
+        }
+        
+        console.log('🧹 Popup cleanup completed');
     }
 });
 
 // Listen for messages from content script
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+const messageListener = (message, sender, sendResponse) => {
     if (message.action === 'updateStatus' && window.popupController) {
         window.popupController.showStatus(message.status, message.type || 'info');
     }
@@ -1108,4 +1134,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         window.popupController.isRunning = false;
         window.popupController.updateUI();
     }
-});
+};
+
+chrome.runtime.onMessage.addListener(messageListener);
+
+// Store reference for cleanup
+if (window.popupController) {
+    window.popupController.messageListener = messageListener;
+}
